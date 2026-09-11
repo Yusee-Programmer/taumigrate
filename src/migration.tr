@@ -1,20 +1,41 @@
-# taumigrate.migration — Migration: one versioned revision in the chain,
-# plus build_chain() which orders a flat Vec[Migration] into the single
-# linear root-to-head sequence the runner applies/reverts in.
+# taumigrate.migration — Migration: one versioned revision in the
+# migration GRAPH, plus build_chain()/heads() which validate it and
+# order it into a topological (root-to-heads) sequence the runner
+# applies/reverts in.
 #
 # Modeled on Alembic's own revision model: each migration carries its own
-# `revision` id and the `down_revision` (parent) it was written against,
-# rather than relying on filename/timestamp ordering the way Rails/Django
-# migrations do -- this is what lets `--autogenerate` insert a new
-# migration on top of "whatever the current head is" without the caller
-# having to know or maintain a separate ordering.
+# `revision` id and the `down_revisions` (parent(s)) it was written
+# against, rather than relying on filename/timestamp ordering the way
+# Rails/Django migrations do -- this is what lets autogenerate insert a
+# new migration on top of "whatever the current head is" without the
+# caller having to know or maintain a separate ordering.
 #
-# Scope: a single linear chain only (one root, one head) -- Alembic's own
-# branch/merge support (multiple heads merged back into one) is real but
-# meaningfully more complex (a DAG, not a list) and nothing in this
-# project has a concrete need for it yet. `build_chain` raises a DbError
-# naming the problem (multiple heads, multiple roots, a broken/orphan
-# `down_revision`, or a cycle) rather than silently guessing an order.
+# **The graph, not a chain**: a migration normally has exactly ONE parent
+# (`Migration.init`, the common case -- a linear step forward). Two or
+# more migrations can share the SAME parent (a BRANCH/fork -- e.g. two
+# feature branches both built on top of the same released revision,
+# developed independently); a migration can also have TWO OR MORE
+# parents (`Migration.init_merge` -- a MERGE, joining two branches back
+# into one, Alembic's own exact mechanism for this). The result is a DAG
+# with a single root but potentially several simultaneous HEADS until
+# merged. `build_chain` still returns a flat, topologically-valid
+# `Vec[Migration]` (a linear order respecting every dependency) even when
+# the underlying graph branches -- see `heads()` for the actual set of
+# current head revisions, and runner.tr's multi-head-aware operations
+# (`current_revisions`, `upgrade_to_heads`, `downgrade_head`) for working
+# with more than one branch at once. The single-parent, single-head
+# functions this package shipped with first (`Migration.init`,
+# `current_revision`, `upgrade_to_head`, `downgrade_one`, `downgrade_to`)
+# keep working completely unchanged for the common, non-branching case.
+#
+# Deliberately NOT supported: multiple independent ROOTS (two migration
+# sets sharing no common ancestor at all) -- see `build_chain`'s
+# MIGRATION_MULTI_ROOT below. That's a different problem (two unrelated
+# histories accidentally combined) from branching FROM a shared root,
+# which this file fully supports. Also not supported: named branch
+# labels (Alembic's `branch_labels`/`@branchname` addressing) -- a
+# caller identifies a specific head by its OWN revision id instead (see
+# `downgrade_head`); no concrete need for labels has come up.
 
 from db_error import DbError
 from std.core.vec import Vec
@@ -22,17 +43,38 @@ from std.core.map import Map
 from std.sys.time import Clock
 
 pub class Migration:
-    pub revision:      str
-    pub down_revision: str   # "" = this migration is the chain's root (base)
-    pub message:        str
-    pub up:               def(str) -> Vec[str]   # dialect -> SQL statements to apply, in order
-    pub down:               def(str) -> Vec[str]   # dialect -> SQL statements to reverse it, in order
+    pub revision:       str
+    pub down_revision:  str          # convenience: down_revisions[0], or "" for a root or a merge migration -- see down_revisions for the canonical field
+    pub down_revisions: Vec[str]     # this migration's parent(s): 0 entries (the graph's root), 1 (the ordinary case), 2+ (a MERGE migration joining branches back into one)
+    pub message:          str
+    pub up:                  def(str) -> Vec[str]   # dialect -> SQL statements to apply, in order
+    pub down:                  def(str) -> Vec[str]   # dialect -> SQL statements to reverse it, in order
 
 extend Migration:
     pub def init(revision: str, down_revision: str, message: str, up: def(str) -> Vec[str], down: def(str) -> Vec[str]) -> Migration:
         mut m = Migration()
         m.revision = revision
         m.down_revision = down_revision
+        m.down_revisions = Vec[str].init(1)
+        if down_revision != "": m.down_revisions.push(down_revision)
+        m.message = message
+        m.up = up
+        m.down = down
+        return m
+
+    # A MERGE migration: joins two or more existing branch heads back
+    # into a single one. `down_revisions` must have 2+ entries, each an
+    # existing revision in the set this migration is used with. `up`/
+    # `down` are typically empty statement lists (Alembic's own
+    # convention -- a merge migration exists to record the graph join,
+    # not to run DDL), though nothing stops a real migration from doing
+    # both at once.
+    pub def init_merge(revision: str, down_revisions: Vec[str], message: str, up: def(str) -> Vec[str], down: def(str) -> Vec[str]) -> Migration:
+        mut m = Migration()
+        m.revision = revision
+        m.down_revisions = down_revisions
+        m.down_revision = ""
+        if down_revisions.len > 0: m.down_revision = down_revisions.get(0)
         m.message = message
         m.up = up
         m.down = down
@@ -47,70 +89,109 @@ extend Migration:
 pub def new_revision_id() -> str:
     return Clock.now_ms().to_str()
 
-# Order a flat Vec[Migration] into its single linear root-to-head chain by
-# following `down_revision` (parent) links forward. Raises DbError (not a
-# silent best-effort order) on:
-#   - MIGRATION_MULTI_ROOT: more than one migration with down_revision==""
-#   - MIGRATION_NO_ROOT:    migrations given but none has down_revision==""
-#   - MIGRATION_ORPHAN:     a down_revision that names no migration in the set
-#   - MIGRATION_MULTI_HEAD: more than one migration is nobody's down_revision
-#   - MIGRATION_CYCLE:      following the chain never reaches every migration
-#     (the only way that happens once multi-root/orphan/multi-head are
-#     already ruled out is a cycle among the remainder)
-pub def build_chain(migrations: Vec[Migration]) throws DbError -> Vec[Migration]:
-    mut ordered: Vec[Migration] = Vec[Migration].init(migrations.len)
-    if migrations.len == 0: return ordered
+pub class MigrationGraph:
+    pub by_revision: Map[str, Migration]
+    pub children_of: Map[str, Vec[str]]   # revision -> every OTHER migration built directly on top of it (0, 1, or 2+ children -- 2+ is a branch point)
+    pub ordered:      Vec[Migration]        # a topologically-valid order (every migration after all of its own parents)
 
-    mut by_revision = Map[str, Migration].init(migrations.len)
-    mut children_of = Map[str, str].init(migrations.len)   # down_revision -> the ONE revision built on it
-    mut roots: Vec[str] = Vec[str].init(2)
+# Validate a flat Vec[Migration] as a single-root DAG and produce a
+# topological order for it. Shared by `build_chain`/`heads`. Raises
+# DbError (never a silent best-effort guess) on:
+#   - MIGRATION_DUP_REVISION: two migrations share the same revision id
+#   - MIGRATION_NO_ROOT:      migrations given but none has an empty down_revisions
+#   - MIGRATION_MULTI_ROOT:   more than one migration has an empty
+#     down_revisions -- multiple DISCONNECTED migration sets, not a
+#     branch (a branch is two+ migrations sharing the SAME non-empty
+#     parent, which is fully supported and not an error)
+#   - MIGRATION_ORPHAN: a down_revisions entry naming nothing in the set
+#   - MIGRATION_CYCLE:  a down_revisions cycle (or any other reason some
+#     migrations are never reachable once the checks above pass)
+def _build_graph(migrations: Vec[Migration]) throws DbError -> MigrationGraph:
+    mut g = MigrationGraph()
+    g.by_revision = Map[str, Migration].init(migrations.len)
+    g.children_of = Map[str, Vec[str]].init(migrations.len)
+    g.ordered = Vec[Migration].init(migrations.len)
+    if migrations.len == 0: return g
+
+    mut in_degree = Map[str, int].init(migrations.len)
+    mut roots_count = 0
     mut i = 0
     while i < migrations.len:
         mut m = migrations.get(i)
-        if by_revision.contains(m.revision):
+        if g.by_revision.contains(m.revision):
             raise(DbError.init("MIGRATION_DUP_REVISION", "duplicate migration revision '" + m.revision + "'"))
-        by_revision.insert(m.revision, m)
-        if m.down_revision == "":
-            roots.push(m.revision)
-        else:
-            if children_of.contains(m.down_revision):
-                raise(DbError.init("MIGRATION_MULTI_HEAD", "revision '" + m.down_revision + "' has two migrations built on it ('" + children_of.get(m.down_revision) + "' and '" + m.revision + "') -- branching chains are not supported"))
-            children_of.insert(m.down_revision, m.revision)
+        g.by_revision.insert(m.revision, m)
+        in_degree.insert(m.revision, m.down_revisions.len)
+        if m.down_revisions.len == 0: roots_count = roots_count + 1
         i = i + 1
 
-    if roots.len == 0:
-        raise(DbError.init("MIGRATION_NO_ROOT", "no migration has down_revision == \"\" (nothing to start the chain from)"))
-    if roots.len > 1:
-        raise(DbError.init("MIGRATION_MULTI_ROOT", "more than one migration has down_revision == \"\" (" + roots.len.to_str() + " roots) -- branching chains are not supported"))
+    if roots_count == 0:
+        raise(DbError.init("MIGRATION_NO_ROOT", "no migration has an empty down_revisions (nothing to start the graph from)"))
+    if roots_count > 1:
+        raise(DbError.init("MIGRATION_MULTI_ROOT", "more than one migration has an empty down_revisions (" + roots_count.to_str() + " roots) -- multiple disconnected migration sets are not supported (branching FROM a shared root is -- see this file's header comment)"))
 
-    # Walk forward from the root via children_of. `cur` is always either
-    # the root (verified present above) or a value from children_of,
-    # which only ever holds `m.revision` for a migration already inserted
-    # into by_revision in the loop above -- so `cur` is always resolvable
-    # here; no separate existence check is needed mid-walk.
-    mut cur = roots.get(0)
-    while cur != "":
-        ordered.push(by_revision.get(cur))
-        if children_of.contains(cur):
-            cur = children_of.get(cur)
-        else:
-            cur = ""
+    mut i2 = 0
+    while i2 < migrations.len:
+        mut m2 = migrations.get(i2)
+        mut j = 0
+        while j < m2.down_revisions.len:
+            mut parent = m2.down_revisions.get(j)
+            if not g.by_revision.contains(parent):
+                raise(DbError.init("MIGRATION_ORPHAN", "migration '" + m2.revision + "' has a down_revision '" + parent + "', which is not in the given set"))
+            mut kids: Vec[str] = Vec[str].init(2)
+            if g.children_of.contains(parent): kids = g.children_of.get(parent)
+            kids.push(m2.revision)
+            g.children_of.insert(parent, kids)
+            j = j + 1
+        i2 = i2 + 1
 
-    if ordered.len != migrations.len:
-        # Some migrations were never reached from the root. Distinguish
-        # WHY: if any unreached migration's down_revision doesn't name a
-        # real revision at all, that's a dangling reference (orphan) --
-        # report that specifically, since it's the more actionable
-        # diagnosis. Otherwise every unreached migration's down_revision
-        # DOES resolve to a real revision, just not one the root walk
-        # ever passed through -- a genuine cycle (or a second,
-        # disconnected sub-chain sharing no root with the first).
-        mut oi = 0
-        while oi < migrations.len:
-            mut om = migrations.get(oi)
-            if om.down_revision != "" and not by_revision.contains(om.down_revision):
-                raise(DbError.init("MIGRATION_ORPHAN", "migration '" + om.revision + "' has down_revision '" + om.down_revision + "', which is not in the given set"))
-            oi = oi + 1
-        raise(DbError.init("MIGRATION_CYCLE", "migration chain is broken: " + ordered.len.to_str() + " of " + migrations.len.to_str() + " migrations are reachable from the root -- check for a down_revision cycle (or a second, disconnected sub-chain) among the rest"))
+    # Kahn's algorithm: repeatedly take every not-yet-placed migration
+    # whose in-degree (remaining unsatisfied parents) has hit 0, in
+    # ORIGINAL input order among ties, for a deterministic result.
+    mut done = Map[str, bool].init(migrations.len)
+    mut remaining = migrations.len
+    while remaining > 0:
+        mut progressed = false
+        mut k = 0
+        while k < migrations.len:
+            mut mk = migrations.get(k)
+            if not done.contains(mk.revision) and in_degree.get(mk.revision) == 0:
+                g.ordered.push(mk)
+                done.insert(mk.revision, true)
+                remaining = remaining - 1
+                progressed = true
+                if g.children_of.contains(mk.revision):
+                    mut kids2 = g.children_of.get(mk.revision)
+                    mut kj = 0
+                    while kj < kids2.len:
+                        mut kid_rev = kids2.get(kj)
+                        in_degree.insert(kid_rev, in_degree.get(kid_rev) - 1)
+                        kj = kj + 1
+            k = k + 1
+        if not progressed:
+            raise(DbError.init("MIGRATION_CYCLE", "migration graph is broken: " + g.ordered.len.to_str() + " of " + migrations.len.to_str() + " migrations are reachable -- check for a down_revision cycle among the rest"))
+    return g
 
-    return ordered
+# Order a flat Vec[Migration] into A topologically-valid sequence (every
+# migration appears after all of its own parents) -- for a plain, non-
+# branching chain, this is the single unambiguous root-to-head order; for
+# a branching graph, it's ONE valid interleaving of the independent
+# branches (deterministic -- see `_build_graph`'s own comment -- but not
+# the only mathematically valid one). See this file's header comment for
+# the full account of what's supported.
+pub def build_chain(migrations: Vec[Migration]) throws DbError -> Vec[Migration]:
+    mut g = _build_graph(migrations)?
+    return g.ordered
+
+# The graph's current HEAD revisions -- migrations nobody else is built
+# on top of. Exactly one for a plain linear chain; two or more when
+# there are unmerged branches. Validates the same way `build_chain` does.
+pub def heads(migrations: Vec[Migration]) throws DbError -> Vec[str]:
+    mut g = _build_graph(migrations)?
+    mut out: Vec[str] = Vec[str].init(2)
+    mut i = 0
+    while i < g.ordered.len:
+        mut rev = g.ordered.get(i).revision
+        if not g.children_of.contains(rev): out.push(rev)
+        i = i + 1
+    return out

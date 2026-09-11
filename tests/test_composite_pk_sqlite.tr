@@ -1,0 +1,123 @@
+# tests.test_composite_pk_sqlite — real, in-memory proof of composite
+# (multi-column) primary key support: CreateTable DDL, autogenerate
+# diff/apply when a column is ADDED to what was a single-column PK
+# (turning it into a composite key, via SQLite's rebuild dance), and real
+# row data surviving the whole cycle.
+
+from metadata import MetaData
+from table import Table
+from column import Column
+from col_types import Integer, Text
+from introspect import IntrospectedTable, introspect_schema
+from diff import diff_schema
+from autogen import generate_migration_sql
+from sqlite_dialect import SqliteConnection, SqliteResultSet
+from engine import Engine
+from db_error import DbError
+from std.core.vec import Vec
+from std.test import TestRunner
+
+def run_sql(engine: Engine[SqliteConnection, SqliteResultSet], stmts: Vec[str]) -> bool:
+    mut no_params: Vec[str] = Vec[str].init(0)
+    mut i = 0
+    while i < stmts.len:
+        mut r: Result[SqliteResultSet, DbError] = engine.execute(stmts.get(i), no_params)
+        if r.is_err: return false
+        mut rs = r.ok
+        mut step: Result[bool, DbError] = rs.next()
+        rs.release()
+        if step.is_err: return false
+        i = i + 1
+    return true
+
+def get_int(engine: Engine[SqliteConnection, SqliteResultSet], sql: str) -> int:
+    mut no_params: Vec[str] = Vec[str].init(0)
+    mut r: Result[SqliteResultSet, DbError] = engine.execute(sql, no_params)
+    if r.is_err: return -1
+    mut rs = r.ok
+    mut step: Result[bool, DbError] = rs.next()
+    mut v = -1
+    if not step.is_err and step.ok: v = rs.get_int(0)
+    rs.release()
+    return v
+
+def main():
+    mut t = TestRunner.init("composite PK (sqlite)")
+
+    mut open_r: Result[SqliteConnection, DbError] = SqliteConnection.open(":memory:")
+    if open_r.is_err:
+        t.fail("could not open SQLite connection: " + open_r.err.message)
+        t.summary()
+        return
+    mut engine: Engine[SqliteConnection, SqliteResultSet] = Engine[SqliteConnection, SqliteResultSet].wrap(open_r.ok)
+
+    t.section("CreateTable with a composite PK")
+    mut cols: Vec[Column] = Vec[Column].init(3)
+    cols.push(Column.init("tenant_id", Integer()).pk())
+    cols.push(Column.init("user_id", Integer()).pk())
+    cols.push(Column.init("name", Text()))
+    mut membership = Table.init("memberships", cols)
+    mut sql = membership.create_sql("sqlite")
+    t.assert_true(sql.contains("PRIMARY KEY (tenant_id, user_id)"), "composite PK renders as a table-level constraint")
+    t.assert_false(sql.contains("tenant_id INTEGER PRIMARY KEY"), "no per-column inline PRIMARY KEY for a composite key member")
+
+    mut md = MetaData.init()
+    md.add(membership)
+    t.assert_true(run_sql(engine, _singleton(sql)), "composite-PK CREATE TABLE actually executes")
+
+    mut ins: Vec[str] = Vec[str].init(1)
+    ins.push("INSERT INTO memberships (tenant_id, user_id, name) VALUES (1, 1, 'Ada')")
+    t.assert_true(run_sql(engine, ins), "insert into a composite-PK table succeeds")
+
+    mut intro_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if intro_r.is_err:
+        t.fail("introspect failed: " + intro_r.err.message)
+        t.summary()
+        return
+    mut ops = diff_schema(md, intro_r.ok, "sqlite")
+    t.assert_eq_int(ops.len, 0, "diff is empty once the DB matches a composite-PK target")
+
+    t.section("widening a single-column PK into a composite one (rebuild)")
+    mut cols2: Vec[Column] = Vec[Column].init(2)
+    cols2.push(Column.init("id", Integer()).pk())
+    cols2.push(Column.init("email", Text()).not_null())
+    mut users = Table.init("users", cols2)
+    md.add(users)
+    mut intro2_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not intro2_r.is_err:
+        mut gen2 = generate_migration_sql(md, intro2_r.ok, "sqlite")
+        t.assert_true(run_sql(engine, gen2.up), "creating the single-PK users table succeeds")
+
+    mut ins2: Vec[str] = Vec[str].init(1)
+    ins2.push("INSERT INTO users (id, email) VALUES (1, 'ada@example.com')")
+    run_sql(engine, ins2)
+
+    # Widen users' PK from just "id" to a composite (id, email).
+    users.columns.get(1).primary_key = true
+    users.columns.get(1).nullable = false
+    mut intro3_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if intro3_r.is_err:
+        t.fail("introspect (before widen) failed: " + intro3_r.err.message)
+        t.summary()
+        return
+    mut ops3 = diff_schema(md, intro3_r.ok, "sqlite")
+    t.assert_true(ops3.len > 0, "widening the PK is detected as a diff")
+
+    mut gen3 = generate_migration_sql(md, intro3_r.ok, "sqlite")
+    t.assert_true(run_sql(engine, gen3.up), "applying the composite-PK rebuild succeeds")
+    t.assert_eq_int(get_int(engine, "SELECT id FROM users WHERE email = 'ada@example.com'"), 1, "existing row survives widening the PK to composite")
+
+    mut intro3b_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not intro3b_r.is_err:
+        mut ops3b = diff_schema(md, intro3b_r.ok, "sqlite")
+        t.assert_eq_int(ops3b.len, 0, "diff is empty again after the rebuild")
+
+    t.assert_true(run_sql(engine, gen3.down), "reverting the composite-PK rebuild succeeds")
+    t.assert_eq_int(get_int(engine, "SELECT id FROM users WHERE email = 'ada@example.com'"), 1, "row survives the REVERSED rebuild too")
+
+    t.summary()
+
+def _singleton(s: str) -> Vec[str]:
+    mut v: Vec[str] = Vec[str].init(1)
+    v.push(s)
+    return v

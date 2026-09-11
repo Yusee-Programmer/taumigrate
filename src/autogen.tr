@@ -3,7 +3,9 @@
 # a Migration's `up`/`down` function values need to return.
 #
 # Postgres renders every op directly (CREATE/DROP TABLE, ADD/DROP COLUMN,
-# ALTER COLUMN ... TYPE/SET|DROP NOT NULL) -- Postgres supports all of
+# ALTER COLUMN ... TYPE/SET|DROP NOT NULL, and a primary-key membership
+# change as a constraint-level DROP/ADD CONSTRAINT, once per table since
+# a composite key spans several columns) -- Postgres supports all of
 # these natively. SQLite is different for one specific case: it has NO
 # `ALTER TABLE ... ALTER COLUMN` at all, ever (not a version gap -- a
 # permanent design choice), so a column TYPE/nullable/primary-key change
@@ -19,11 +21,15 @@
 # (SQLite can't combine a rebuild with a separate ALTER anyway, and it's
 # fewer statements than doing them apart).
 #
-# A column-level rename is NOT detected -- diff.tr, like Alembic's own
-# autogenerate, sees a renamed column as an unrelated add+drop (name-based
-# matching can't tell them apart from a real drop-then-add). Reviewing a
-# generated migration before running it is expected, exactly as it is
-# with Alembic.
+# `RenameColumn` (diff.tr's rename-detection heuristic -- see its own
+# header comment) renders as a direct `RENAME COLUMN`, identical syntax
+# on both dialects (SQLite 3.25+, which this project vendors 3.53.4 of,
+# and Postgres both support it) -- no SQLite rebuild needed for a PURE
+# rename. When a table has a rename AND a separate AlterColumn needing
+# the rebuild dance, the rebuild's own INSERT...SELECT is rename-aware
+# (reads the renamed column's data from its PRE-rename name) so the two
+# combine correctly instead of the rebuild silently losing the renamed
+# column's data.
 
 from db_error import DbError
 from metadata import MetaData
@@ -74,25 +80,6 @@ def _has_col_name(cols: Vec[Column], name: str) -> bool:
         i = i + 1
     return false
 
-def _has_icol_name(cols: Vec[IntrospectedColumn], name: str) -> bool:
-    mut i = 0
-    while i < cols.len:
-        if cols.get(i).name == name: return true
-        i = i + 1
-    return false
-
-# Column names present in BOTH the old (introspected) and new (target)
-# shape -- the ones an INSERT...SELECT rebuild can carry data across for.
-def _common_column_names(new_cols: Vec[Column], old_cols: Vec[IntrospectedColumn]) -> Vec[str]:
-    mut out: Vec[str] = Vec[str].init(new_cols.len)
-    mut i = 0
-    while i < new_cols.len:
-        mut n = new_cols.get(i).name
-        if _has_icol_name(old_cols, n):
-            out.push(n)
-        i = i + 1
-    return out
-
 def _join_cols(names: Vec[str]) -> str:
     mut s = ""
     mut i = 0
@@ -105,13 +92,51 @@ def _join_cols(names: Vec[str]) -> str:
 def _rename_table(t: Table, new_name: str) -> Table:
     return Table.init(new_name, t.columns)
 
+def _renames_for_table(ops: Vec[SchemaOp], tname: str) -> Vec[SchemaOp]:
+    mut out: Vec[SchemaOp] = Vec[SchemaOp].init(2)
+    mut i = 0
+    while i < ops.len:
+        match ops.get(i):
+            case SchemaOp.RenameColumn(otname, _, _):
+                if otname == tname: out.push(ops.get(i))
+            case _: pass
+        i = i + 1
+    return out
+
+# Given this table's RenameColumn ops, the PRE-rename name for a
+# post-rename (target) column name -- "" if `new_name` isn't a rename
+# target.
+def _rename_old_name_for_new(renames: Vec[SchemaOp], new_name: str) -> str:
+    mut i = 0
+    while i < renames.len:
+        match renames.get(i):
+            case SchemaOp.RenameColumn(_, old_name, new_col):
+                if new_col.name == new_name: return old_name
+            case _: pass
+        i = i + 1
+    return ""
+
+# The reverse of the above: the POST-rename name for a pre-rename (old,
+# introspected) column name -- "" if `old_name` isn't a rename source.
+def _rename_new_name_for_old(renames: Vec[SchemaOp], old_name: str) -> str:
+    mut i = 0
+    while i < renames.len:
+        match renames.get(i):
+            case SchemaOp.RenameColumn(_, r_old_name, new_col):
+                if r_old_name == old_name: return new_col.name
+            case _: pass
+        i = i + 1
+    return ""
+
 pub def generate_migration_sql(md: MetaData, introspected: Vec[IntrospectedTable], dialect: str) -> GeneratedSql:
     mut ops = diff_schema(md, introspected, dialect)
     mut g = GeneratedSql.init()
 
     # Pass 1: table-level ops (always safe to render directly), and
-    # collect which tables need a SQLite rebuild.
+    # collect which tables need a SQLite rebuild / a Postgres primary-key
+    # constraint swap.
     mut sqlite_rebuild_tables: Vec[str] = Vec[str].init(4)
+    mut pg_pk_change_tables: Vec[str] = Vec[str].init(4)
     mut i = 0
     while i < ops.len:
         match ops.get(i):
@@ -122,9 +147,11 @@ pub def generate_migration_sql(md: MetaData, introspected: Vec[IntrospectedTable
                 mut old_t = introspected_to_table(it)
                 g.up.push(old_t.drop_sql())
                 g.down.push(old_t.create_sql(dialect))
-            case SchemaOp.AlterColumn(tname, _, _):
+            case SchemaOp.AlterColumn(tname, old_pk, new_pk):
                 if dialect == "sqlite" and not _vec_contains_str(sqlite_rebuild_tables, tname):
                     sqlite_rebuild_tables.push(tname)
+                if dialect == "postgres" and old_pk.primary_key != new_pk.primary_key and not _vec_contains_str(pg_pk_change_tables, tname):
+                    pg_pk_change_tables.push(tname)
             case _: pass
         i = i + 1
 
@@ -146,15 +173,35 @@ pub def generate_migration_sql(md: MetaData, introspected: Vec[IntrospectedTable
                 if dialect == "postgres":
                     _emit_postgres_alter(g, tname, old, new)
                 # sqlite: absorbed into the rebuild pass below
+            case SchemaOp.RenameColumn(tname, old_name, new_col):
+                # Identical syntax on both dialects; no rebuild needed
+                # even on SQLite for a PURE rename (one with no OTHER
+                # AlterColumn on the same table) -- if the table IS also
+                # undergoing a rebuild for some other reason, this rename
+                # is instead absorbed into that rebuild's own INSERT
+                # column mapping (see _emit_sqlite_rebuild), so skip it
+                # here to avoid emitting it twice.
+                if not _vec_contains_str(sqlite_rebuild_tables, tname):
+                    g.up.push("ALTER TABLE " + tname + " RENAME COLUMN " + old_name + " TO " + new_col.name)
+                    g.down.push("ALTER TABLE " + tname + " RENAME COLUMN " + new_col.name + " TO " + old_name)
             case _: pass
         i2 = i2 + 1
 
     # Pass 3: SQLite rebuild dance, one per table that needs it, covering
-    # ALL of that table's changes (Alter + any Add/Drop) in one go.
+    # ALL of that table's changes (Alter + any Add/Drop/Rename) in one go.
     mut ai = 0
     while ai < sqlite_rebuild_tables.len:
-        _emit_sqlite_rebuild(g, md, introspected, sqlite_rebuild_tables.get(ai), dialect)
+        _emit_sqlite_rebuild(g, md, introspected, ops, sqlite_rebuild_tables.get(ai), dialect)
         ai = ai + 1
+
+    # Pass 4: Postgres primary-key constraint swap, ONCE per table (not
+    # once per changed column -- a composite key spans several columns,
+    # and Postgres has no per-column PK ALTER at all; see
+    # `_emit_postgres_pk_swap`'s own header comment).
+    mut pi = 0
+    while pi < pg_pk_change_tables.len:
+        _emit_postgres_pk_swap(g, md, introspected, pg_pk_change_tables.get(pi))
+        pi = pi + 1
 
     return g
 
@@ -170,27 +217,103 @@ def _emit_postgres_alter(g: GeneratedSql, tname: str, old: IntrospectedColumn, n
         else:
             g.up.push("ALTER TABLE " + tname + " ALTER COLUMN " + new.name + " SET NOT NULL")
             g.down.push("ALTER TABLE " + tname + " ALTER COLUMN " + new.name + " DROP NOT NULL")
-    # A primary-key change needs a constraint-level ADD/DROP CONSTRAINT,
-    # not a per-column ALTER -- rare enough in an autogenerated migration
-    # (usually a deliberate, hand-written change) that it's left as an
-    # explicit, documented gap rather than guessed at here.
+    # Primary-key membership changes are handled separately, once per
+    # TABLE (not per column) -- see _emit_postgres_pk_swap, called from
+    # generate_migration_sql's pass 4.
 
-def _emit_sqlite_rebuild(g: GeneratedSql, md: MetaData, introspected: Vec[IntrospectedTable], tname: str, dialect: str):
+# A primary-key change (single- or multi-column) needs constraint-level
+# `ADD`/`DROP CONSTRAINT` DDL, not a per-column `ALTER COLUMN` -- and,
+# for a COMPOSITE key, the constraint spans several columns, so it must
+# be handled ONCE per table, not once per changed column (which is why
+# this isn't folded into `_emit_postgres_alter`). Assumes Postgres's
+# default constraint-naming convention (`<table>_pkey`, what Postgres
+# itself generates for a `PRIMARY KEY` added without an explicit
+# constraint name) -- a hand-named constraint needs a hand-written
+# migration, matching this tool's "review before running" philosophy
+# everywhere else (e.g. a detected column rename is still a heuristic
+# guess, not proof of intent -- see diff.tr's own header comment).
+def _emit_postgres_pk_swap(g: GeneratedSql, md: MetaData, introspected: Vec[IntrospectedTable], tname: str):
+    mut target = _find_table(md.tables, tname)
+    mut old_it = _find_introspected_table(introspected, tname)
+
+    mut old_pk: Vec[str] = Vec[str].init(2)
+    mut oi = 0
+    while oi < old_it.columns.len:
+        mut oc = old_it.columns.get(oi)
+        if oc.primary_key: old_pk.push(oc.name)
+        oi = oi + 1
+    mut new_pk = target.primary_key_columns()
+
+    mut constraint_name = tname + "_pkey"
+    if old_pk.len > 0:
+        g.up.push("ALTER TABLE " + tname + " DROP CONSTRAINT " + constraint_name)
+    if new_pk.len > 0:
+        g.up.push("ALTER TABLE " + tname + " ADD CONSTRAINT " + constraint_name + " PRIMARY KEY (" + _join_cols(new_pk) + ")")
+    # down: reverse it, old shape back.
+    if new_pk.len > 0:
+        g.down.push("ALTER TABLE " + tname + " DROP CONSTRAINT " + constraint_name)
+    if old_pk.len > 0:
+        g.down.push("ALTER TABLE " + tname + " ADD CONSTRAINT " + constraint_name + " PRIMARY KEY (" + _join_cols(old_pk) + ")")
+
+# `ops` is the FULL diff (not just this table's) so any RenameColumn for
+# `tname` can be folded into the INSERT...SELECT column mapping -- a
+# renamed column would otherwise be invisible to a plain by-name common-
+# column intersection (its name changed), silently dropping its data.
+def _emit_sqlite_rebuild(g: GeneratedSql, md: MetaData, introspected: Vec[IntrospectedTable], ops: Vec[SchemaOp], tname: str, dialect: str):
     mut target = _find_table(md.tables, tname)
     mut old_it = _find_introspected_table(introspected, tname)
     mut tmp_name = tname + "__taumigrate_new"
+    mut renames = _renames_for_table(ops, tname)
 
-    mut common = _common_column_names(target.columns, old_it.columns)
-    mut common_list = _join_cols(common)
+    # UP: insert into the NEW shape, reading each destination column's
+    # data from whichever OLD column it corresponds to -- its own name if
+    # unchanged, or its PRE-rename name if it was renamed.
+    mut up_dest: Vec[str] = Vec[str].init(target.columns.len)
+    mut up_src: Vec[str] = Vec[str].init(target.columns.len)
+    mut ti2 = 0
+    while ti2 < target.columns.len:
+        mut tc = target.columns.get(ti2)
+        mut old_name = _rename_old_name_for_new(renames, tc.name)
+        if old_name != "":
+            up_dest.push(tc.name)
+            up_src.push(old_name)
+        elif old_it.has_col(tc.name):
+            up_dest.push(tc.name)
+            up_src.push(tc.name)
+        # else: a brand new column with no corresponding old data -- omitted from both lists.
+        ti2 = ti2 + 1
+    mut up_dest_list = _join_cols(up_dest)
+    mut up_src_list = _join_cols(up_src)
 
     mut new_shape = _rename_table(target, tmp_name)
     g.up.push(new_shape.create_sql(dialect))
-    g.up.push("INSERT INTO " + tmp_name + " (" + common_list + ") SELECT " + common_list + " FROM " + tname)
+    g.up.push("INSERT INTO " + tmp_name + " (" + up_dest_list + ") SELECT " + up_src_list + " FROM " + tname)
     g.up.push("DROP TABLE " + tname)
     g.up.push("ALTER TABLE " + tmp_name + " RENAME TO " + tname)
 
+    # DOWN: insert into the OLD shape, reading each destination column's
+    # data from whichever NEW column it corresponds to -- its own name if
+    # unchanged, or its POST-rename name if it was renamed (the table
+    # currently holds the NEW shape at the point DOWN runs).
+    mut down_dest: Vec[str] = Vec[str].init(old_it.columns.len)
+    mut down_src: Vec[str] = Vec[str].init(old_it.columns.len)
+    mut oi2 = 0
+    while oi2 < old_it.columns.len:
+        mut oc = old_it.columns.get(oi2)
+        mut new_name = _rename_new_name_for_old(renames, oc.name)
+        if new_name != "":
+            down_dest.push(oc.name)
+            down_src.push(new_name)
+        elif _has_col_name(target.columns, oc.name):
+            down_dest.push(oc.name)
+            down_src.push(oc.name)
+        # else: a column being dropped by this migration -- omitted from both lists.
+        oi2 = oi2 + 1
+    mut down_dest_list = _join_cols(down_dest)
+    mut down_src_list = _join_cols(down_src)
+
     mut old_shape = _rename_table(introspected_to_table(old_it), tmp_name)
     g.down.push(old_shape.create_sql(dialect))
-    g.down.push("INSERT INTO " + tmp_name + " (" + common_list + ") SELECT " + common_list + " FROM " + tname)
+    g.down.push("INSERT INTO " + tmp_name + " (" + down_dest_list + ") SELECT " + down_src_list + " FROM " + tname)
     g.down.push("DROP TABLE " + tname)
     g.down.push("ALTER TABLE " + tmp_name + " RENAME TO " + tname)

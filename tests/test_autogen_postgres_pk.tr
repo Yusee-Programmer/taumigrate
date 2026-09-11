@@ -1,0 +1,77 @@
+# tests.test_autogen_postgres_pk — real, RUNNABLE proof of the Postgres
+# primary-key constraint-swap SQL generation, without needing a live
+# Postgres server: diff_schema()/generate_migration_sql() are pure
+# functions of (MetaData, Vec[IntrospectedTable], dialect), so a
+# hand-built IntrospectedTable (standing in for whatever
+# introspect_postgres() WOULD have returned from a real server) exercises
+# the exact same code path introspect_postgres()'s own real output would
+# feed into. Only introspect_postgres() ITSELF (the live SQL queries)
+# stays unverified live -- see introspect.tr's header comment.
+
+from metadata import MetaData
+from table import Table
+from column import Column
+from col_types import Integer, Text
+from introspect import IntrospectedTable, IntrospectedColumn
+from autogen import generate_migration_sql
+from std.core.vec import Vec
+from std.test import TestRunner
+
+def has_line(lines: Vec[str], needle: str) -> bool:
+    mut i = 0
+    while i < lines.len:
+        if lines.get(i) == needle: return true
+        i = i + 1
+    return false
+
+def main():
+    mut t = TestRunner.init("autogen postgres PK constraint (pure, no live server)")
+
+    t.section("single-column PK widened to composite")
+    mut target_cols: Vec[Column] = Vec[Column].init(2)
+    target_cols.push(Column.init("id", Integer()).pk())
+    target_cols.push(Column.init("tenant_id", Integer()).pk())
+    mut md = MetaData.init()
+    md.add(Table.init("users", target_cols))
+
+    mut old_it = IntrospectedTable.init("users")
+    old_it.columns.push(IntrospectedColumn.init("id", "integer", false, true))
+    old_it.columns.push(IntrospectedColumn.init("tenant_id", "integer", true, false))
+    mut introspected: Vec[IntrospectedTable] = Vec[IntrospectedTable].init(1)
+    introspected.push(old_it)
+
+    mut gen = generate_migration_sql(md, introspected, "postgres")
+    t.assert_true(has_line(gen.up, "ALTER TABLE users DROP CONSTRAINT users_pkey"), "up drops the old single-column PK constraint")
+    t.assert_true(has_line(gen.up, "ALTER TABLE users ADD CONSTRAINT users_pkey PRIMARY KEY (id, tenant_id)"), "up adds the new composite PK constraint")
+    t.assert_true(has_line(gen.down, "ALTER TABLE users DROP CONSTRAINT users_pkey"), "down drops the new composite PK constraint")
+    t.assert_true(has_line(gen.down, "ALTER TABLE users ADD CONSTRAINT users_pkey PRIMARY KEY (id)"), "down restores the old single-column PK constraint")
+
+    t.section("dropping the PK entirely")
+    mut target_cols2: Vec[Column] = Vec[Column].init(1)
+    target_cols2.push(Column.init("id", Integer()))
+    mut md2 = MetaData.init()
+    md2.add(Table.init("logs", target_cols2))
+
+    mut old_it2 = IntrospectedTable.init("logs")
+    old_it2.columns.push(IntrospectedColumn.init("id", "integer", false, true))
+    mut introspected2: Vec[IntrospectedTable] = Vec[IntrospectedTable].init(1)
+    introspected2.push(old_it2)
+
+    mut gen2 = generate_migration_sql(md2, introspected2, "postgres")
+    t.assert_true(has_line(gen2.up, "ALTER TABLE logs DROP CONSTRAINT logs_pkey"), "up drops the PK constraint")
+    t.assert_false(has_line(gen2.up, "ALTER TABLE logs ADD CONSTRAINT logs_pkey PRIMARY KEY (id)"), "up does NOT re-add a PK (target has none)")
+    t.assert_true(has_line(gen2.down, "ALTER TABLE logs ADD CONSTRAINT logs_pkey PRIMARY KEY (id)"), "down restores the dropped PK constraint")
+
+    t.section("column type change still emits a plain ALTER COLUMN, unaffected by PK handling")
+    mut target_cols3: Vec[Column] = Vec[Column].init(1)
+    target_cols3.push(Column.init("note", Text()))
+    mut md3 = MetaData.init()
+    md3.add(Table.init("notes", target_cols3))
+    mut old_it3 = IntrospectedTable.init("notes")
+    old_it3.columns.push(IntrospectedColumn.init("note", "integer", true, false))
+    mut introspected3: Vec[IntrospectedTable] = Vec[IntrospectedTable].init(1)
+    introspected3.push(old_it3)
+    mut gen3 = generate_migration_sql(md3, introspected3, "postgres")
+    t.assert_true(has_line(gen3.up, "ALTER TABLE notes ALTER COLUMN note TYPE TEXT"), "plain type change still works alongside the new PK handling")
+
+    t.summary()

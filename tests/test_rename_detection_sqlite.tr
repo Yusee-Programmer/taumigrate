@@ -1,0 +1,143 @@
+# tests.test_rename_detection_sqlite — real, in-memory proof of rename
+# detection: a same-shaped add+drop pair reads as a RenameColumn, renders
+# as a real RENAME COLUMN (no rebuild), and preserves existing row data.
+# Also proves the combined case: a rename ALONGSIDE an unrelated
+# type-changing AlterColumn on the same table still preserves the
+# renamed column's data through the SQLite rebuild dance.
+
+from metadata import MetaData
+from table import Table
+from column import Column
+from col_types import Integer, Text, Float
+from introspect import IntrospectedTable, introspect_schema
+from diff import diff_schema, SchemaOp
+from autogen import generate_migration_sql
+from sqlite_dialect import SqliteConnection, SqliteResultSet
+from engine import Engine
+from db_error import DbError
+from std.core.vec import Vec
+from std.test import TestRunner
+
+def run_sql(engine: Engine[SqliteConnection, SqliteResultSet], stmts: Vec[str]) -> bool:
+    mut no_params: Vec[str] = Vec[str].init(0)
+    mut i = 0
+    while i < stmts.len:
+        mut r: Result[SqliteResultSet, DbError] = engine.execute(stmts.get(i), no_params)
+        if r.is_err: return false
+        mut rs = r.ok
+        mut step: Result[bool, DbError] = rs.next()
+        rs.release()
+        if step.is_err: return false
+        i = i + 1
+    return true
+
+def get_str(engine: Engine[SqliteConnection, SqliteResultSet], sql: str) -> str:
+    mut no_params: Vec[str] = Vec[str].init(0)
+    mut r: Result[SqliteResultSet, DbError] = engine.execute(sql, no_params)
+    if r.is_err: return "<err>"
+    mut rs = r.ok
+    mut step: Result[bool, DbError] = rs.next()
+    mut v = "<none>"
+    if not step.is_err and step.ok: v = rs.get_str(0)
+    rs.release()
+    return v
+
+def is_rename_op(ops: Vec[SchemaOp]) -> bool:
+    mut i = 0
+    while i < ops.len:
+        match ops.get(i):
+            case SchemaOp.RenameColumn(_, _, _): return true
+            case _: pass
+        i = i + 1
+    return false
+
+def main():
+    mut t = TestRunner.init("rename detection (sqlite)")
+
+    mut open_r: Result[SqliteConnection, DbError] = SqliteConnection.open(":memory:")
+    if open_r.is_err:
+        t.fail("could not open SQLite connection: " + open_r.err.message)
+        t.summary()
+        return
+    mut engine: Engine[SqliteConnection, SqliteResultSet] = Engine[SqliteConnection, SqliteResultSet].wrap(open_r.ok)
+
+    t.section("pure rename -> no rebuild, data preserved")
+    mut cols: Vec[Column] = Vec[Column].init(2)
+    cols.push(Column.init("id", Integer()).pk())
+    cols.push(Column.init("username", Text()).not_null())
+    mut md = MetaData.init()
+    md.add(Table.init("users", cols))
+
+    mut intro1_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if intro1_r.is_err:
+        t.fail("introspect (empty) failed: " + intro1_r.err.message)
+        t.summary()
+        return
+    mut gen1 = generate_migration_sql(md, intro1_r.ok, "sqlite")
+    t.assert_true(run_sql(engine, gen1.up), "create users table")
+
+    mut ins: Vec[str] = Vec[str].init(1)
+    ins.push("INSERT INTO users (id, username) VALUES (1, 'ada_lovelace')")
+    run_sql(engine, ins)
+
+    # Rename "username" -> "handle" in the target.
+    md.tables.get(0).columns.get(1).name = "handle"
+    mut intro2_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if intro2_r.is_err:
+        t.fail("introspect (before rename) failed: " + intro2_r.err.message)
+        t.summary()
+        return
+    mut ops2 = diff_schema(md, intro2_r.ok, "sqlite")
+    t.assert_eq_int(ops2.len, 1, "exactly one op for the rename")
+    t.assert_true(is_rename_op(ops2), "the op is a RenameColumn, not add+drop")
+
+    mut gen2 = generate_migration_sql(md, intro2_r.ok, "sqlite")
+    t.assert_eq_int(gen2.up.len, 1, "a pure rename is ONE statement, no rebuild")
+    t.assert_true(gen2.up.get(0) == "ALTER TABLE users RENAME COLUMN username TO handle", "exact RENAME COLUMN SQL")
+    t.assert_true(run_sql(engine, gen2.up), "applying the rename succeeds")
+    t.assert_eq_str(get_str(engine, "SELECT handle FROM users WHERE id = 1"), "ada_lovelace", "existing row's data survives the rename")
+
+    t.assert_true(run_sql(engine, gen2.down), "reverting the rename succeeds")
+    t.assert_eq_str(get_str(engine, "SELECT username FROM users WHERE id = 1"), "ada_lovelace", "data survives the reversed rename too")
+    run_sql(engine, gen2.up)   # leave DB in the renamed state for the next section
+
+    t.section("rename combined with an unrelated type change (rebuild-aware)")
+    mut cols2: Vec[Column] = Vec[Column].init(2)
+    cols2.push(Column.init("id", Integer()).pk())
+    cols2.push(Column.init("score", Float()))
+    cols2.push(Column.init("status", Text()))
+    mut md3 = MetaData.init()
+    md3.add(Table.init("players", cols2))
+    mut intro3_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not intro3_r.is_err:
+        mut gen3 = generate_migration_sql(md3, intro3_r.ok, "sqlite")
+        run_sql(engine, gen3.up)
+    mut ins3: Vec[str] = Vec[str].init(1)
+    ins3.push("INSERT INTO players (id, score, status) VALUES (1, 7, 'active')")
+    run_sql(engine, ins3)
+
+    # Rename "score" -> "points" (same shape, detected as a rename) AND,
+    # SEPARATELY, tighten "status" to NOT NULL (an unrelated AlterColumn
+    # on a DIFFERENT column of the same table) -- forces the SQLite
+    # rebuild dance to run while a rename is ALSO pending on that table.
+    md3.tables.get(0).columns.get(1).name = "points"
+    md3.tables.get(0).columns.get(2).nullable = false
+    mut intro4_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if intro4_r.is_err:
+        t.fail("introspect (before combined change) failed: " + intro4_r.err.message)
+        t.summary()
+        return
+    mut gen4 = generate_migration_sql(md3, intro4_r.ok, "sqlite")
+    t.assert_true(gen4.up.len > 1, "the combined change is a real multi-statement rebuild")
+    t.assert_true(run_sql(engine, gen4.up), "applying the combined rebuild succeeds")
+    t.assert_true(get_str(engine, "SELECT points FROM players WHERE id = 1").contains("7"), "renamed column's data survives a rebuild happening on the SAME table")
+
+    mut intro4b_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not intro4b_r.is_err:
+        mut ops4b = diff_schema(md3, intro4b_r.ok, "sqlite")
+        t.assert_eq_int(ops4b.len, 0, "diff is empty again after the combined rebuild")
+
+    t.assert_true(run_sql(engine, gen4.down), "reverting the combined rebuild succeeds")
+    t.assert_true(get_str(engine, "SELECT score FROM players WHERE id = 1").contains("7"), "data survives the REVERSED combined rebuild too")
+
+    t.summary()

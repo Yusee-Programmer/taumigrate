@@ -23,6 +23,24 @@
 # in this project, `--check`-clean but unverified against a live server
 # (see introspect.tr's header comment); SQLite comparison is exact and
 # verified (SQLite echoes back the CREATE TABLE's DDL text verbatim).
+#
+# RENAME DETECTION: exactly one `AddColumn` and one `DropColumn` for the
+# SAME table, with a matching type/nullable/primary-key shape, is treated
+# as a likely rename (`RenameColumn`) rather than an unrelated add+drop
+# pair. This isn't just cosmetic: an undetected rename generates a
+# migration that DROPS the old column (losing its data -- the SQLite
+# rebuild's `INSERT ... SELECT` only carries columns common to both
+# shapes by NAME, so a renamed column is invisible to it) and adds a
+# fresh, empty one under the new name. Detecting it instead emits a
+# single, cheap, DATA-PRESERVING `RENAME COLUMN` on both dialects (SQLite
+# 3.25+ and Postgres both support it directly -- no rebuild needed even
+# on SQLite). Like Alembic's own autogenerate, this is a HEURISTIC based
+# purely on name-independent structural matching, not proof of intent --
+# reviewing a generated migration before running it is still expected,
+# same as every other autogenerate output from this tool. The heuristic
+# is deliberately conservative: it only fires when there is EXACTLY one
+# add and one drop candidate for that table (never guesses among several
+# same-shaped candidates, which would be genuinely ambiguous).
 
 from metadata import MetaData
 from table import Table
@@ -36,6 +54,7 @@ pub enum SchemaOp:
     AddColumn(table_name: str, column: Column)
     DropColumn(table_name: str, column: IntrospectedColumn)
     AlterColumn(table_name: str, old: IntrospectedColumn, new: Column)
+    RenameColumn(table_name: str, old_name: str, new_column: Column)
 
 def _find_introspected(tables: Vec[IntrospectedTable], name: str) -> IntrospectedTable:
     mut i = 0
@@ -123,11 +142,14 @@ pub def diff_schema(md: MetaData, introspected: Vec[IntrospectedTable], dialect:
         else:
             mut it = _find_introspected(introspected, t.name)
 
+            mut pending_adds: Vec[Column] = Vec[Column].init(2)
+            mut pending_drops: Vec[IntrospectedColumn] = Vec[IntrospectedColumn].init(2)
+
             mut ci = 0
             while ci < t.columns.len:
                 mut c = t.columns.get(ci)
                 if not it.has_col(c.name):
-                    ops.push(SchemaOp.AddColumn(t.name, c))
+                    pending_adds.push(c)
                 else:
                     mut ic = _find_introspected_column(it, c.name)
                     mut changed = c.primary_key != ic.primary_key
@@ -141,8 +163,32 @@ pub def diff_schema(md: MetaData, introspected: Vec[IntrospectedTable], dialect:
             while ici < it.columns.len:
                 mut ic2 = it.columns.get(ici)
                 if not _has_column(t.columns, ic2.name):
-                    ops.push(SchemaOp.DropColumn(t.name, ic2))
+                    pending_drops.push(ic2)
                 ici = ici + 1
+
+            # See this file's header comment ("RENAME DETECTION") for why
+            # this fires conservatively -- exactly one candidate on each
+            # side, matching shape -- rather than guessing among several.
+            if pending_adds.len == 1 and pending_drops.len == 1:
+                mut cand_new = pending_adds.get(0)
+                mut cand_old = pending_drops.get(0)
+                mut same_shape = cand_new.primary_key == cand_old.primary_key
+                if same_shape: same_shape = cand_new.nullable == cand_old.nullable
+                if same_shape: same_shape = types_match(dialect, cand_new.col_type.ddl(dialect), cand_old.raw_type)
+                if same_shape:
+                    ops.push(SchemaOp.RenameColumn(t.name, cand_old.name, cand_new))
+                else:
+                    ops.push(SchemaOp.AddColumn(t.name, cand_new))
+                    ops.push(SchemaOp.DropColumn(t.name, cand_old))
+            else:
+                mut pai = 0
+                while pai < pending_adds.len:
+                    ops.push(SchemaOp.AddColumn(t.name, pending_adds.get(pai)))
+                    pai = pai + 1
+                mut pdi = 0
+                while pdi < pending_drops.len:
+                    ops.push(SchemaOp.DropColumn(t.name, pending_drops.get(pdi)))
+                    pdi = pdi + 1
         ti = ti + 1
 
     mut ii = 0

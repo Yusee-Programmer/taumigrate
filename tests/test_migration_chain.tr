@@ -1,8 +1,10 @@
-# tests.test_migration_chain — pure-logic proof of migration.tr's
-# build_chain(): normal linear ordering, plus every documented error case
-# (multi-root, multi-head, orphan, cycle). No DB involved.
+# tests.test_migration_chain — pure-logic proof of migration.tr's DAG
+# model: normal linear ordering, branching (two migrations on the same
+# parent), merging (one migration with two parents) back down to a
+# single head, plus every documented error case (multi-root, no-root,
+# orphan, cycle, duplicate revision). No DB involved.
 
-from migration import Migration, build_chain
+from migration import Migration, build_chain, heads
 from db_error import DbError
 from std.core.vec import Vec
 from std.test import TestRunner
@@ -16,8 +18,15 @@ def noop_down(dialect: str) -> Vec[str]:
 def mk(rev: str, down: str) -> Migration:
     return Migration.init(rev, down, "m" + rev, noop_up, noop_down)
 
+def has_str(v: Vec[str], s: str) -> bool:
+    mut i = 0
+    while i < v.len:
+        if v.get(i) == s: return true
+        i = i + 1
+    return false
+
 def main():
-    mut t = TestRunner.init("migration chain builder")
+    mut t = TestRunner.init("migration graph builder")
 
     t.section("normal linear chain")
     mut ms: Vec[Migration] = Vec[Migration].init(3)
@@ -33,6 +42,10 @@ def main():
         t.assert_eq_str(chain.get(0).revision, "1", "root is first")
         t.assert_eq_str(chain.get(1).revision, "2", "middle is second")
         t.assert_eq_str(chain.get(2).revision, "3", "head is last")
+    mut hr: Result[Vec[str], DbError] = heads(ms)
+    if not hr.is_err:
+        t.assert_eq_int(hr.ok.len, 1, "a plain linear chain has exactly one head")
+        t.assert_eq_str(hr.ok.get(0), "3", "the head is the tip of the chain")
 
     t.section("empty input")
     mut empty: Vec[Migration] = Vec[Migration].init(0)
@@ -41,7 +54,7 @@ def main():
     if not r2.is_err:
         t.assert_eq_int(r2.ok.len, 0, "empty input yields an empty chain")
 
-    t.section("multi-root")
+    t.section("multi-root (disconnected sets) is still rejected")
     mut mr: Vec[Migration] = Vec[Migration].init(2)
     mr.push(mk("a", ""))
     mr.push(mk("b", ""))
@@ -58,15 +71,39 @@ def main():
     if r4.is_err:
         t.assert_eq_str(r4.err.code, "MIGRATION_NO_ROOT", "no migration has down_revision==\"\" so the root check fires before an orphan walk ever starts")
 
-    t.section("multi-head (branch)")
+    t.section("branching: two migrations on the same parent is now VALID")
     mut mh: Vec[Migration] = Vec[Migration].init(3)
     mh.push(mk("1", ""))
     mh.push(mk("2a", "1"))
     mh.push(mk("2b", "1"))
     mut r5: Result[Vec[Migration], DbError] = build_chain(mh)
-    t.assert_true(r5.is_err, "two migrations built on the same parent is rejected")
-    if r5.is_err:
-        t.assert_eq_str(r5.err.code, "MIGRATION_MULTI_HEAD", "multi-head error code")
+    t.assert_true(not r5.is_err, "a branch (fork) from a shared parent is accepted, not an error")
+    if not r5.is_err:
+        t.assert_eq_int(r5.ok.len, 3, "all 3 migrations are reachable")
+    mut hr2: Result[Vec[str], DbError] = heads(mh)
+    if not hr2.is_err:
+        t.assert_eq_int(hr2.ok.len, 2, "an unmerged branch has two current heads")
+        t.assert_true(has_str(hr2.ok, "2a"), "2a is a head")
+        t.assert_true(has_str(hr2.ok, "2b"), "2b is a head")
+
+    t.section("merging two branches back into one")
+    mut mg: Vec[Migration] = Vec[Migration].init(4)
+    mg.push(mk("1", ""))
+    mg.push(mk("2a", "1"))
+    mg.push(mk("2b", "1"))
+    mut merge_parents: Vec[str] = Vec[str].init(2)
+    merge_parents.push("2a")
+    merge_parents.push("2b")
+    mg.push(Migration.init_merge("3merge", merge_parents, "merge branches", noop_up, noop_down))
+    mut r6b: Result[Vec[Migration], DbError] = build_chain(mg)
+    t.assert_true(not r6b.is_err, "a merge migration is accepted")
+    if not r6b.is_err:
+        t.assert_eq_int(r6b.ok.len, 4, "all 4 migrations (including the merge) are reachable")
+        t.assert_eq_str(r6b.ok.get(3).revision, "3merge", "the merge migration sorts after BOTH of its parents")
+    mut hr3: Result[Vec[str], DbError] = heads(mg)
+    if not hr3.is_err:
+        t.assert_eq_int(hr3.ok.len, 1, "merging collapses back to a single head")
+        t.assert_eq_str(hr3.ok.get(0), "3merge", "the merge migration is the new sole head")
 
     t.section("orphan down_revision")
     mut orp: Vec[Migration] = Vec[Migration].init(2)
@@ -76,6 +113,18 @@ def main():
     t.assert_true(r6.is_err, "a down_revision naming a missing migration is rejected")
     if r6.is_err:
         t.assert_eq_str(r6.err.code, "MIGRATION_ORPHAN", "orphan error code")
+
+    t.section("orphan in a merge migration's second parent")
+    mut orp2: Vec[Migration] = Vec[Migration].init(2)
+    orp2.push(mk("1", ""))
+    mut bad_parents: Vec[str] = Vec[str].init(2)
+    bad_parents.push("1")
+    bad_parents.push("nonexistent")
+    orp2.push(Migration.init_merge("2merge", bad_parents, "bad merge", noop_up, noop_down))
+    mut r6c: Result[Vec[Migration], DbError] = build_chain(orp2)
+    t.assert_true(r6c.is_err, "a merge migration's dangling second parent is rejected")
+    if r6c.is_err:
+        t.assert_eq_str(r6c.err.code, "MIGRATION_ORPHAN", "orphan error code applies to any down_revisions entry, not just the first")
 
     t.section("duplicate revision")
     mut dup: Vec[Migration] = Vec[Migration].init(2)

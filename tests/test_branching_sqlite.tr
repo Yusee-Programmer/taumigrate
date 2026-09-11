@@ -1,0 +1,156 @@
+# tests.test_branching_sqlite — real, in-memory proof of the migration
+# DAG's branching + merging against SQLite: two independent feature
+# branches off a shared root, upgraded to both heads, then merged back
+# into one, then downgraded back apart into the two original heads
+# again.
+
+from migration import Migration
+from runner import current_revisions, upgrade_to_heads, downgrade_head, pending_migrations
+from sqlite_dialect import SqliteConnection, SqliteResultSet
+from engine import Engine
+from db_error import DbError
+from std.core.vec import Vec
+from std.test import TestRunner
+
+def up1(dialect: str) -> Vec[str]:
+    mut s: Vec[str] = Vec[str].init(1)
+    s.push("CREATE TABLE base (id INTEGER PRIMARY KEY)")
+    return s
+
+def down1(dialect: str) -> Vec[str]:
+    mut s: Vec[str] = Vec[str].init(1)
+    s.push("DROP TABLE base")
+    return s
+
+def up_a(dialect: str) -> Vec[str]:
+    mut s: Vec[str] = Vec[str].init(1)
+    s.push("CREATE TABLE feature_a (id INTEGER PRIMARY KEY)")
+    return s
+
+def down_a(dialect: str) -> Vec[str]:
+    mut s: Vec[str] = Vec[str].init(1)
+    s.push("DROP TABLE feature_a")
+    return s
+
+def up_b(dialect: str) -> Vec[str]:
+    mut s: Vec[str] = Vec[str].init(1)
+    s.push("CREATE TABLE feature_b (id INTEGER PRIMARY KEY)")
+    return s
+
+def down_b(dialect: str) -> Vec[str]:
+    mut s: Vec[str] = Vec[str].init(1)
+    s.push("DROP TABLE feature_b")
+    return s
+
+def noop_up(dialect: str) -> Vec[str]:
+    return Vec[str].init(0)
+
+def noop_down(dialect: str) -> Vec[str]:
+    return Vec[str].init(0)
+
+def table_exists(engine: Engine[SqliteConnection, SqliteResultSet], name: str) -> bool:
+    mut no_params: Vec[str] = Vec[str].init(0)
+    mut r: Result[SqliteResultSet, DbError] = engine.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='" + name + "'", no_params)
+    if r.is_err: return false
+    mut rs = r.ok
+    mut step: Result[bool, DbError] = rs.next()
+    mut found = false
+    if not step.is_err: found = step.ok
+    rs.release()
+    return found
+
+def has_str(v: Vec[str], s: str) -> bool:
+    mut i = 0
+    while i < v.len:
+        if v.get(i) == s: return true
+        i = i + 1
+    return false
+
+def main():
+    mut t = TestRunner.init("branching + merge migrations (sqlite)")
+
+    mut open_r: Result[SqliteConnection, DbError] = SqliteConnection.open(":memory:")
+    if open_r.is_err:
+        t.fail("could not open SQLite connection: " + open_r.err.message)
+        t.summary()
+        return
+    mut engine: Engine[SqliteConnection, SqliteResultSet] = Engine[SqliteConnection, SqliteResultSet].wrap(open_r.ok)
+
+    mut migrations: Vec[Migration] = Vec[Migration].init(4)
+    migrations.push(Migration.init("1", "", "base", up1, down1))
+    migrations.push(Migration.init("2a", "1", "feature A", up_a, down_a))
+    migrations.push(Migration.init("2b", "1", "feature B", up_b, down_b))
+
+    t.section("upgrade_to_heads applies BOTH branches")
+    mut u1: Result[int, DbError] = upgrade_to_heads[SqliteConnection, SqliteResultSet](engine, "sqlite", migrations)
+    if u1.is_err:
+        t.fail("upgrade_to_heads failed: " + u1.err.message)
+        t.summary()
+        return
+    t.assert_eq_int(u1.ok, 3, "all 3 migrations (base + both branches) applied")
+    t.assert_true(table_exists(engine, "base"), "base table exists")
+    t.assert_true(table_exists(engine, "feature_a"), "feature_a table exists")
+    t.assert_true(table_exists(engine, "feature_b"), "feature_b table exists")
+
+    mut cr1: Result[Vec[str], DbError] = current_revisions[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not cr1.is_err:
+        t.assert_eq_int(cr1.ok.len, 2, "two unmerged heads after upgrading both branches")
+        t.assert_true(has_str(cr1.ok, "2a"), "2a is a current head")
+        t.assert_true(has_str(cr1.ok, "2b"), "2b is a current head")
+
+    mut pend1: Result[Vec[Migration], DbError] = pending_migrations[SqliteConnection, SqliteResultSet](engine, "sqlite", migrations)
+    if not pend1.is_err:
+        t.assert_eq_int(pend1.ok.len, 0, "nothing pending once both branches are fully applied")
+
+    t.section("merging the two branches back into one")
+    mut merge_parents: Vec[str] = Vec[str].init(2)
+    merge_parents.push("2a")
+    merge_parents.push("2b")
+    migrations.push(Migration.init_merge("3merge", merge_parents, "merge A and B", noop_up, noop_down))
+
+    mut pend2: Result[Vec[Migration], DbError] = pending_migrations[SqliteConnection, SqliteResultSet](engine, "sqlite", migrations)
+    if not pend2.is_err:
+        t.assert_eq_int(pend2.ok.len, 1, "exactly the merge migration is pending")
+
+    mut u2: Result[int, DbError] = upgrade_to_heads[SqliteConnection, SqliteResultSet](engine, "sqlite", migrations)
+    if u2.is_err:
+        t.fail("upgrade_to_heads (merge) failed: " + u2.err.message)
+        t.summary()
+        return
+    t.assert_eq_int(u2.ok, 1, "just the merge migration was applied")
+
+    mut cr2: Result[Vec[str], DbError] = current_revisions[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not cr2.is_err:
+        t.assert_eq_int(cr2.ok.len, 1, "merging collapses back to a single current head")
+        t.assert_eq_str(cr2.ok.get(0), "3merge", "the merge migration is the sole current head")
+
+    t.section("downgrade_head splits the merge back apart")
+    mut d1: Result[bool, DbError] = downgrade_head[SqliteConnection, SqliteResultSet](engine, "sqlite", migrations, "3merge")
+    if d1.is_err:
+        t.fail("downgrade_head failed: " + d1.err.message)
+        t.summary()
+        return
+    t.assert_true(d1.ok, "downgrade_head reverted the merge")
+
+    mut cr3: Result[Vec[str], DbError] = current_revisions[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not cr3.is_err:
+        t.assert_eq_int(cr3.ok.len, 2, "reverting the merge splits back into two heads")
+        t.assert_true(has_str(cr3.ok, "2a"), "2a is a head again")
+        t.assert_true(has_str(cr3.ok, "2b"), "2b is a head again")
+
+    t.section("downgrade_head on a SPECIFIC branch, the other untouched")
+    mut d2: Result[bool, DbError] = downgrade_head[SqliteConnection, SqliteResultSet](engine, "sqlite", migrations, "2a")
+    if d2.is_err:
+        t.fail("downgrade_head(2a) failed: " + d2.err.message)
+        t.summary()
+        return
+    t.assert_false(table_exists(engine, "feature_a"), "feature_a table dropped")
+    t.assert_true(table_exists(engine, "feature_b"), "feature_b table UNTOUCHED by downgrading the other branch")
+
+    mut cr4: Result[Vec[str], DbError] = current_revisions[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not cr4.is_err:
+        t.assert_eq_int(cr4.ok.len, 2, "still two heads: base's own branch position, and 2b")
+        t.assert_true(has_str(cr4.ok, "1"), "base (1) is a head again after reverting 2a all the way")
+        t.assert_true(has_str(cr4.ok, "2b"), "2b is still untouched")
+
+    t.summary()

@@ -1,10 +1,11 @@
 # taumigrate.runner — the version-tracking table + upgrade/downgrade
-# operations. Modeled closely on Alembic's own runtime design: ONE
-# tracking table (`taumigrate_version`) holding at most a SINGLE row --
-# the current head revision, not a full history log -- because the
-# chain itself (Migration.down_revision links) is already the history;
-# the DB only needs to remember "where in the chain am I right now". No
-# row at all means "base" (nothing applied yet).
+# operations. Modeled closely on Alembic's own runtime design: the
+# tracking table (`taumigrate_version`) holds one row PER CURRENT HEAD --
+# a single row for the common, non-branching case, more than one only
+# while branches are genuinely unmerged -- not a full history log,
+# because the graph itself (Migration.down_revisions links) is already
+# the history; the DB only needs to remember "where in the graph am I
+# right now". No rows at all means "base" (nothing applied yet).
 #
 # Every operation is a FREE generic function over `[C: DbConnection[RS],
 # RS: DbResultSet]` taking `Engine[C,RS]` + a dialect string, matching
@@ -13,12 +14,29 @@
 # project; a generic CLASS carrying its own connection state was
 # deliberately avoided for the identical reason metadata.tr's header
 # comment gives).
+#
+# Two families of operations:
+#   - SINGULAR (current_revision, upgrade_to_head, downgrade_one,
+#     downgrade_to): the original, single-head API. Behavior is
+#     UNCHANGED for a plain, non-branching migration set (the common
+#     case, and everything this package originally shipped with) --
+#     each now additionally raises a clear MIGRATION_MULTIPLE_HEADS
+#     DbError if the database (or the target graph, for
+#     `upgrade_to_head`) genuinely has more than one head, rather than
+#     silently guessing which one you meant.
+#   - PLURAL / branch-aware (current_revisions, upgrade_to_heads,
+#     downgrade_head): work correctly with any number of simultaneous
+#     heads. `pending_migrations` is branch-aware unconditionally (its
+#     result is identical to the old single-chain-only implementation
+#     for a non-branching set, so this isn't a behavior change, just a
+#     generalization).
 
 from dbapi import DbConnection, DbResultSet
 from db_error import DbError
 from engine import Engine
-from migration import Migration, build_chain
+from migration import Migration, build_chain, heads
 from std.core.vec import Vec
+from std.core.map import Map
 
 def _run_statements[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], stmts: Vec[str]) throws DbError:
     mut no_params: Vec[str] = Vec[str].init(0)
@@ -34,45 +52,92 @@ def _run_statements[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS],
         rs.release()
         i = i + 1
 
+def _vec_str_contains(v: Vec[str], s: str) -> bool:
+    mut i = 0
+    while i < v.len:
+        if v.get(i) == s: return true
+        i = i + 1
+    return false
+
+# `v` with every entry that also appears in `remove` dropped.
+def _minus(v: Vec[str], remove: Vec[str]) -> Vec[str]:
+    mut out: Vec[str] = Vec[str].init(v.len)
+    mut i = 0
+    while i < v.len:
+        if not _vec_str_contains(remove, v.get(i)): out.push(v.get(i))
+        i = i + 1
+    return out
+
+def _find_migration(chain: Vec[Migration], rev: str) throws DbError -> Migration:
+    mut i = 0
+    while i < chain.len:
+        mut m = chain.get(i)
+        if m.revision == rev: return m
+        i = i + 1
+    raise(DbError.init("MIGRATION_UNKNOWN_CURRENT", "revision '" + rev + "' is not present in the given migration set"))
+
 pub def ensure_version_table[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str) throws DbError:
     mut stmts: Vec[str] = Vec[str].init(1)
     stmts.push("CREATE TABLE IF NOT EXISTS taumigrate_version (version_num TEXT NOT NULL)")
     _run_statements[C, RS](engine, stmts)?
 
-pub def current_revision[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str) throws DbError -> str:
+pub def current_revisions[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str) throws DbError -> Vec[str]:
     ensure_version_table[C, RS](engine, dialect)?
     mut no_params: Vec[str] = Vec[str].init(0)
-    mut r: Result[RS, DbError] = engine.execute("SELECT version_num FROM taumigrate_version LIMIT 1", no_params)
+    mut r: Result[RS, DbError] = engine.execute("SELECT version_num FROM taumigrate_version", no_params)
     if r.is_err:
         raise(DbError.init(r.err.code, r.err.message))
     mut rs = r.ok
-    mut step: Result[bool, DbError] = rs.next()
-    if step.is_err:
-        raise(DbError.init(step.err.code, step.err.message))
-    mut rev = ""
-    if step.ok:
-        rev = rs.get_str(0)
+    mut out: Vec[str] = Vec[str].init(2)
+    mut going = true
+    while going:
+        mut step: Result[bool, DbError] = rs.next()
+        if step.is_err:
+            raise(DbError.init(step.err.code, step.err.message))
+        if not step.ok:
+            going = false
+        else:
+            out.push(rs.get_str(0))
     rs.release()
-    return rev
+    return out
 
-pub def set_revision[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, revision: str) throws DbError:
+# Convenience for the common, non-branching case: "" if nothing is
+# applied, the ONE current revision if there's exactly one. Raises
+# MIGRATION_MULTIPLE_HEADS if the database genuinely has more than one
+# (use `current_revisions` instead once you know you're dealing with a
+# branching migration set).
+pub def current_revision[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str) throws DbError -> str:
+    mut revs = current_revisions[C, RS](engine, dialect)?
+    if revs.len > 1:
+        raise(DbError.init("MIGRATION_MULTIPLE_HEADS", "the database has " + revs.len.to_str() + " current heads; use current_revisions() for the multi-head-aware result"))
+    if revs.len == 0: return ""
+    return revs.get(0)
+
+pub def set_heads[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, target_heads: Vec[str]) throws DbError:
     mut clear: Vec[str] = Vec[str].init(1)
     clear.push("DELETE FROM taumigrate_version")
     _run_statements[C, RS](engine, clear)?
-    if revision != "":
-        mut no_params: Vec[str] = Vec[str].init(0)
+    mut i = 0
+    while i < target_heads.len:
         # A bound param would be the more usual choice, but this table is
         # entirely internal (never touches user-controlled input -- the
         # value is always a Migration.revision string this same package
-        # generated), so a plain literal keeps this one call symmetrical
-        # with every other DDL/control statement in this file.
+        # generated), so a plain literal keeps this symmetrical with
+        # every other DDL/control statement in this file.
         mut ins: Vec[str] = Vec[str].init(1)
-        ins.push("INSERT INTO taumigrate_version (version_num) VALUES ('" + revision + "')")
+        ins.push("INSERT INTO taumigrate_version (version_num) VALUES ('" + target_heads.get(i) + "')")
         _run_statements[C, RS](engine, ins)?
+        i = i + 1
+
+pub def set_revision[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, revision: str) throws DbError:
+    mut hs: Vec[str] = Vec[str].init(1)
+    if revision != "": hs.push(revision)
+    set_heads[C, RS](engine, dialect, hs)?
 
 # -1 = "base" (before the chain's first migration); raises if `rev` is
 # non-empty but not present in `chain` (the DB's recorded current
-# revision doesn't match any migration this caller passed in).
+# revision doesn't match any migration this caller passed in). Only used
+# by the SINGULAR downgrade_one/downgrade_to below.
 def _chain_index_of(chain: Vec[Migration], rev: str) throws DbError -> int:
     if rev == "": return 0 - 1
     mut i = 0
@@ -81,39 +146,109 @@ def _chain_index_of(chain: Vec[Migration], rev: str) throws DbError -> int:
         i = i + 1
     raise(DbError.init("MIGRATION_UNKNOWN_CURRENT", "the database's current revision '" + rev + "' is not present in the given migration set"))
 
+# Every revision that is an ancestor of (or equal to) one of `current_heads`
+# -- i.e. already applied -- computed by walking `down_revisions` backward
+# from each head. Branch-aware: correctly covers every branch's own
+# history even when only ONE of several sibling branches' heads is
+# passed in (see runner.tr's/migration.tr's header comments for why a
+# migration whose PARENT is still an ancestor of a DIFFERENT current head
+# is still correctly treated as "not yet applied", not as "unreachable").
+def _applied_set(chain: Vec[Migration], current_heads: Vec[str]) -> Map[str, bool]:
+    mut by_rev = Map[str, Migration].init(chain.len)
+    mut ci = 0
+    while ci < chain.len:
+        mut m = chain.get(ci)
+        by_rev.insert(m.revision, m)
+        ci = ci + 1
+    mut applied = Map[str, bool].init(chain.len)
+    mut frontier: Vec[str] = Vec[str].init(current_heads.len)
+    mut hi = 0
+    while hi < current_heads.len:
+        frontier.push(current_heads.get(hi))
+        hi = hi + 1
+    mut idx = 0
+    while idx < frontier.len:
+        mut rev = frontier.get(idx)
+        if not applied.contains(rev):
+            applied.insert(rev, true)
+            if by_rev.contains(rev):
+                mut m2 = by_rev.get(rev)
+                mut pj = 0
+                while pj < m2.down_revisions.len:
+                    frontier.push(m2.down_revisions.get(pj))
+                    pj = pj + 1
+        idx = idx + 1
+    return applied
+
+# Branch-aware: identical result to the original single-chain-only
+# implementation for a non-branching migration set (there's exactly one
+# current head, and `_applied_set` degenerates to exactly that head's own
+# ancestor chain) -- not a behavior change, a generalization.
 pub def pending_migrations[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, migrations: Vec[Migration]) throws DbError -> Vec[Migration]:
     mut chain = build_chain(migrations)?
-    mut cur = current_revision[C, RS](engine, dialect)?
-    mut start = _chain_index_of(chain, cur)? + 1
-    mut out: Vec[Migration] = Vec[Migration].init(chain.len - start)
-    mut i = start
+    mut cur_heads = current_revisions[C, RS](engine, dialect)?
+    mut applied = _applied_set(chain, cur_heads)
+    mut out: Vec[Migration] = Vec[Migration].init(chain.len)
+    mut i = 0
     while i < chain.len:
-        out.push(chain.get(i))
+        mut m = chain.get(i)
+        if not applied.contains(m.revision):
+            out.push(m)
         i = i + 1
     return out
 
-pub def upgrade_to_head[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, migrations: Vec[Migration]) throws DbError -> int:
-    mut chain = build_chain(migrations)?
-    mut cur = current_revision[C, RS](engine, dialect)?
-    mut start = _chain_index_of(chain, cur)? + 1
+# Applies ONE migration (assumed already known to be ready -- every one
+# of its own down_revisions is in `current_heads`'s ancestor set) and
+# updates the version table for it: `m`'s own down_revisions are dropped
+# from the head set (they're no longer a graph "tip" once something is
+# built on them) and `m.revision` is added. This single rule correctly
+# handles every case: an ordinary single-parent step (replaces its one
+# parent), a NEW fork (parent stays a head if some OTHER branch off it
+# hasn't been touched -- see this function's own callers, which never
+# pass an untouched sibling's parent as a head to remove unless it's
+# actually still literally present), and a MERGE migration (removes BOTH
+# parents, replacing them with the one merge revision).
+def _apply_one[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, m: Migration, current_heads: Vec[str]) throws DbError -> Vec[str]:
+    _run_statements[C, RS](engine, m.up(dialect))?
+    mut new_heads = _minus(current_heads, m.down_revisions)
+    new_heads.push(m.revision)
+    set_heads[C, RS](engine, dialect, new_heads)?
+    return new_heads
+
+# Applies EVERY pending migration, across every branch, until the graph's
+# full set of heads is reached. The genuinely branch-aware "run to
+# completion" operation -- see `upgrade_to_head` for the singular,
+# single-target convenience wrapper.
+pub def upgrade_to_heads[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, migrations: Vec[Migration]) throws DbError -> int:
+    mut pending = pending_migrations[C, RS](engine, dialect, migrations)?
+    mut cur_heads = current_revisions[C, RS](engine, dialect)?
     mut count = 0
-    mut i = start
-    while i < chain.len:
-        mut m = chain.get(i)
-        _run_statements[C, RS](engine, m.up(dialect))?
-        set_revision[C, RS](engine, dialect, m.revision)?
+    mut i = 0
+    while i < pending.len:
+        cur_heads = _apply_one[C, RS](engine, dialect, pending.get(i), cur_heads)?
         count = count + 1
         i = i + 1
     return count
 
+# Convenience for the common, non-branching case: requires the GIVEN
+# migration set to have exactly one graph head overall (raises
+# MIGRATION_MULTIPLE_HEADS otherwise -- ambiguous which head you meant),
+# then applies everything pending toward it. Behavior is unchanged from
+# the original single-chain-only implementation for a plain chain.
+pub def upgrade_to_head[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, migrations: Vec[Migration]) throws DbError -> int:
+    mut all_heads = heads(migrations)?
+    if all_heads.len > 1:
+        raise(DbError.init("MIGRATION_MULTIPLE_HEADS", "the migration set has " + all_heads.len.to_str() + " heads; use upgrade_to_heads() instead"))
+    mut n: int = upgrade_to_heads[C, RS](engine, dialect, migrations)?
+    return n
+
+# Applies just the next ready migration (branch-aware: whichever pending
+# migration is first in topological order -- see `pending_migrations`).
 pub def upgrade_one[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, migrations: Vec[Migration]) throws DbError -> bool:
-    mut chain = build_chain(migrations)?
-    mut cur = current_revision[C, RS](engine, dialect)?
-    mut start = _chain_index_of(chain, cur)? + 1
-    if start >= chain.len: return false
-    mut m = chain.get(start)
-    _run_statements[C, RS](engine, m.up(dialect))?
-    set_revision[C, RS](engine, dialect, m.revision)?
+    mut pending = pending_migrations[C, RS](engine, dialect, migrations)?
+    if pending.len == 0: return false
+    mut cur_heads = current_revisions[C, RS](engine, dialect)?
+    _apply_one[C, RS](engine, dialect, pending.get(0), cur_heads)?
     return true
 
 pub def downgrade_one[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, migrations: Vec[Migration]) throws DbError -> bool:
@@ -142,3 +277,28 @@ pub def downgrade_to[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS]
         count = count + 1
         cur = current_revision[C, RS](engine, dialect)?
     return count
+
+# Branch-aware: reverts ONE step on a SPECIFIC current head (identified
+# by its own revision id -- there's no named-branch-label system here,
+# see migration.tr's header comment for why). Reverting a MERGE migration
+# correctly splits back into its own multiple parents as separate heads
+# again (the exact reverse of what applying it did).
+pub def downgrade_head[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, migrations: Vec[Migration], head: str) throws DbError -> bool:
+    mut cur_heads = current_revisions[C, RS](engine, dialect)?
+    if not _vec_str_contains(cur_heads, head):
+        raise(DbError.init("MIGRATION_UNKNOWN_CURRENT", "'" + head + "' is not one of the database's current heads"))
+    mut chain = build_chain(migrations)?
+    mut m = _find_migration(chain, head)?
+    _run_statements[C, RS](engine, m.down(dialect))?
+    mut new_heads = _minus(cur_heads, _single_str(head))
+    mut pi = 0
+    while pi < m.down_revisions.len:
+        new_heads.push(m.down_revisions.get(pi))
+        pi = pi + 1
+    set_heads[C, RS](engine, dialect, new_heads)?
+    return true
+
+def _single_str(s: str) -> Vec[str]:
+    mut v: Vec[str] = Vec[str].init(1)
+    v.push(s)
+    return v
