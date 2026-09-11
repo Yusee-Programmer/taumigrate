@@ -1,0 +1,144 @@
+# taumigrate.runner — the version-tracking table + upgrade/downgrade
+# operations. Modeled closely on Alembic's own runtime design: ONE
+# tracking table (`taumigrate_version`) holding at most a SINGLE row --
+# the current head revision, not a full history log -- because the
+# chain itself (Migration.down_revision links) is already the history;
+# the DB only needs to remember "where in the chain am I right now". No
+# row at all means "base" (nothing applied yet).
+#
+# Every operation is a FREE generic function over `[C: DbConnection[RS],
+# RS: DbResultSet]` taking `Engine[C,RS]` + a dialect string, matching
+# metadata.tr's own established convention in tauorm (generic FREE
+# functions over this exact bound are proven reliable throughout this
+# project; a generic CLASS carrying its own connection state was
+# deliberately avoided for the identical reason metadata.tr's header
+# comment gives).
+
+from dbapi import DbConnection, DbResultSet
+from db_error import DbError
+from engine import Engine
+from migration import Migration, build_chain
+from std.core.vec import Vec
+
+def _run_statements[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], stmts: Vec[str]) throws DbError:
+    mut no_params: Vec[str] = Vec[str].init(0)
+    mut i = 0
+    while i < stmts.len:
+        mut r: Result[RS, DbError] = engine.execute(stmts.get(i), no_params)
+        if r.is_err:
+            raise(DbError.init(r.err.code, r.err.message))
+        mut rs = r.ok
+        mut step: Result[bool, DbError] = rs.next()
+        if step.is_err:
+            raise(DbError.init(step.err.code, step.err.message))
+        rs.release()
+        i = i + 1
+
+pub def ensure_version_table[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str) throws DbError:
+    mut stmts: Vec[str] = Vec[str].init(1)
+    stmts.push("CREATE TABLE IF NOT EXISTS taumigrate_version (version_num TEXT NOT NULL)")
+    _run_statements[C, RS](engine, stmts)?
+
+pub def current_revision[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str) throws DbError -> str:
+    ensure_version_table[C, RS](engine, dialect)?
+    mut no_params: Vec[str] = Vec[str].init(0)
+    mut r: Result[RS, DbError] = engine.execute("SELECT version_num FROM taumigrate_version LIMIT 1", no_params)
+    if r.is_err:
+        raise(DbError.init(r.err.code, r.err.message))
+    mut rs = r.ok
+    mut step: Result[bool, DbError] = rs.next()
+    if step.is_err:
+        raise(DbError.init(step.err.code, step.err.message))
+    mut rev = ""
+    if step.ok:
+        rev = rs.get_str(0)
+    rs.release()
+    return rev
+
+pub def set_revision[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, revision: str) throws DbError:
+    mut clear: Vec[str] = Vec[str].init(1)
+    clear.push("DELETE FROM taumigrate_version")
+    _run_statements[C, RS](engine, clear)?
+    if revision != "":
+        mut no_params: Vec[str] = Vec[str].init(0)
+        # A bound param would be the more usual choice, but this table is
+        # entirely internal (never touches user-controlled input -- the
+        # value is always a Migration.revision string this same package
+        # generated), so a plain literal keeps this one call symmetrical
+        # with every other DDL/control statement in this file.
+        mut ins: Vec[str] = Vec[str].init(1)
+        ins.push("INSERT INTO taumigrate_version (version_num) VALUES ('" + revision + "')")
+        _run_statements[C, RS](engine, ins)?
+
+# -1 = "base" (before the chain's first migration); raises if `rev` is
+# non-empty but not present in `chain` (the DB's recorded current
+# revision doesn't match any migration this caller passed in).
+def _chain_index_of(chain: Vec[Migration], rev: str) throws DbError -> int:
+    if rev == "": return 0 - 1
+    mut i = 0
+    while i < chain.len:
+        if chain.get(i).revision == rev: return i
+        i = i + 1
+    raise(DbError.init("MIGRATION_UNKNOWN_CURRENT", "the database's current revision '" + rev + "' is not present in the given migration set"))
+
+pub def pending_migrations[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, migrations: Vec[Migration]) throws DbError -> Vec[Migration]:
+    mut chain = build_chain(migrations)?
+    mut cur = current_revision[C, RS](engine, dialect)?
+    mut start = _chain_index_of(chain, cur)? + 1
+    mut out: Vec[Migration] = Vec[Migration].init(chain.len - start)
+    mut i = start
+    while i < chain.len:
+        out.push(chain.get(i))
+        i = i + 1
+    return out
+
+pub def upgrade_to_head[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, migrations: Vec[Migration]) throws DbError -> int:
+    mut chain = build_chain(migrations)?
+    mut cur = current_revision[C, RS](engine, dialect)?
+    mut start = _chain_index_of(chain, cur)? + 1
+    mut count = 0
+    mut i = start
+    while i < chain.len:
+        mut m = chain.get(i)
+        _run_statements[C, RS](engine, m.up(dialect))?
+        set_revision[C, RS](engine, dialect, m.revision)?
+        count = count + 1
+        i = i + 1
+    return count
+
+pub def upgrade_one[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, migrations: Vec[Migration]) throws DbError -> bool:
+    mut chain = build_chain(migrations)?
+    mut cur = current_revision[C, RS](engine, dialect)?
+    mut start = _chain_index_of(chain, cur)? + 1
+    if start >= chain.len: return false
+    mut m = chain.get(start)
+    _run_statements[C, RS](engine, m.up(dialect))?
+    set_revision[C, RS](engine, dialect, m.revision)?
+    return true
+
+pub def downgrade_one[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, migrations: Vec[Migration]) throws DbError -> bool:
+    mut chain = build_chain(migrations)?
+    mut cur = current_revision[C, RS](engine, dialect)?
+    mut idx = _chain_index_of(chain, cur)?
+    if idx < 0: return false   # already at base
+    mut m = chain.get(idx)
+    _run_statements[C, RS](engine, m.down(dialect))?
+    mut prev_rev = ""
+    if idx > 0: prev_rev = chain.get(idx - 1).revision
+    set_revision[C, RS](engine, dialect, prev_rev)?
+    return true
+
+# Reverts migrations one at a time until the current revision equals
+# `target` ("" = base -- revert everything). Returns the number reverted.
+# Stops (without reaching `target`) if base is hit first -- e.g. `target`
+# doesn't name a revision on the current chain below where the DB
+# actually is; it does not loop forever chasing an unreachable target.
+pub def downgrade_to[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str, migrations: Vec[Migration], target: str) throws DbError -> int:
+    mut count = 0
+    mut cur = current_revision[C, RS](engine, dialect)?
+    while cur != target:
+        mut did = downgrade_one[C, RS](engine, dialect, migrations)?
+        if not did: return count
+        count = count + 1
+        cur = current_revision[C, RS](engine, dialect)?
+    return count

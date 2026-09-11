@@ -1,0 +1,112 @@
+# tests.test_introspect_sqlite — real, in-memory proof that
+# introspect_sqlite() reflects an actual SQLite schema (built by hand via
+# raw SQL, deliberately NOT via tauorm's own Table/Column, so this test
+# doesn't just check "what we wrote comes back out") correctly: table
+# names, column names, nullability, and primary-key detection.
+
+from introspect import IntrospectedTable, IntrospectedColumn, introspect_schema, introspected_to_table
+from sqlite_dialect import SqliteConnection, SqliteResultSet
+from engine import Engine
+from db_error import DbError
+from std.core.vec import Vec
+from std.test import TestRunner
+
+def find_table(tables: Vec[IntrospectedTable], name: str) -> IntrospectedTable:
+    mut i = 0
+    while i < tables.len:
+        mut t = tables.get(i)
+        if t.name == name: return t
+        i = i + 1
+    return IntrospectedTable()
+
+def find_col(it: IntrospectedTable, name: str) -> IntrospectedColumn:
+    mut i = 0
+    while i < it.columns.len:
+        mut c = it.columns.get(i)
+        if c.name == name: return c
+        i = i + 1
+    return IntrospectedColumn()
+
+def main():
+    mut t = TestRunner.init("introspect (sqlite)")
+
+    mut open_r: Result[SqliteConnection, DbError] = SqliteConnection.open(":memory:")
+    if open_r.is_err:
+        t.fail("could not open SQLite connection: " + open_r.err.message)
+        t.summary()
+        return
+    mut engine: Engine[SqliteConnection, SqliteResultSet] = Engine[SqliteConnection, SqliteResultSet].wrap(open_r.ok)
+
+    mut no_params: Vec[str] = Vec[str].init(0)
+    mut ddl1: Result[SqliteResultSet, DbError] = engine.execute("CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL, price REAL)", no_params)
+    if ddl1.is_err:
+        t.fail("create widgets failed: " + ddl1.err.message)
+        t.summary()
+        return
+    mut ddl1rs = ddl1.ok
+    mut ddl1step: Result[bool, DbError] = ddl1rs.next()
+    ddl1rs.release()
+    if ddl1step.is_err:
+        t.fail("step widgets create failed: " + ddl1step.err.message)
+        t.summary()
+        return
+
+    mut ddl2: Result[SqliteResultSet, DbError] = engine.execute("CREATE TABLE tags (id INTEGER PRIMARY KEY, label TEXT)", no_params)
+    if ddl2.is_err:
+        t.fail("create tags failed: " + ddl2.err.message)
+        t.summary()
+        return
+    mut ddl2rs = ddl2.ok
+    mut ddl2step: Result[bool, DbError] = ddl2rs.next()
+    ddl2rs.release()
+    if ddl2step.is_err:
+        t.fail("step tags create failed: " + ddl2step.err.message)
+        t.summary()
+        return
+
+    t.section("table discovery")
+    mut tables_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if tables_r.is_err:
+        t.fail("introspect_schema failed: " + tables_r.err.message)
+        t.summary()
+        return
+    mut tables = tables_r.ok
+    t.assert_eq_int(tables.len, 2, "both tables discovered")
+
+    mut widgets_found = false
+    mut tags_found = false
+    mut wi = 0
+    while wi < tables.len:
+        if tables.get(wi).name == "widgets": widgets_found = true
+        if tables.get(wi).name == "tags": tags_found = true
+        wi = wi + 1
+    t.assert_true(widgets_found, "widgets table found")
+    t.assert_true(tags_found, "tags table found")
+
+    t.section("column shape")
+    mut widgets = find_table(tables, "widgets")
+    t.assert_eq_int(widgets.columns.len, 3, "widgets has 3 columns")
+    t.assert_true(widgets.has_col("id"), "widgets has id")
+    t.assert_true(widgets.has_col("name"), "widgets has name")
+    t.assert_true(widgets.has_col("price"), "widgets has price")
+
+    mut id_col = find_col(widgets, "id")
+    t.assert_true(id_col.primary_key, "id is primary key")
+    t.assert_false(id_col.nullable, "primary key column is not nullable")
+
+    mut name_col = find_col(widgets, "name")
+    t.assert_false(name_col.primary_key, "name is not primary key")
+    t.assert_false(name_col.nullable, "name is NOT NULL")
+    t.assert_eq_str(name_col.raw_type, "TEXT", "name's raw type is TEXT")
+
+    mut price_col = find_col(widgets, "price")
+    t.assert_true(price_col.nullable, "price has no NOT NULL, so it's nullable")
+    t.assert_eq_str(price_col.raw_type, "REAL", "price's raw type is REAL")
+
+    t.section("introspected_to_table round-trips into valid DDL")
+    mut rebuilt = introspected_to_table(widgets)
+    mut create_sql = rebuilt.create_sql("sqlite")
+    t.assert_true(create_sql.contains("widgets"), "rebuilt DDL names the table")
+    t.assert_true(create_sql.contains("name"), "rebuilt DDL includes the name column")
+
+    t.summary()

@@ -1,0 +1,24 @@
+# taupkg lock file -- do not edit manually
+# It records the exact resolved dependency graph. Commit it for reproducible builds.
+
+[[pkg]]
+name       = "sqlite3"
+version    = "0.1.0"
+constraint = "*"
+source     = "local:../tausqlite3"
+checksum   = "sha256:ca55bad02d8b5575d95d1fbb4f56905452e7854454760d5904dc46361905078b"
+
+[[pkg]]
+name       = "tauorm"
+version    = "0.1.0"
+constraint = "*"
+source     = "local:../tauorm"
+checksum   = "sha256:344a721ad2eb90c4403c9d785b91005b22f7de86faff4f6ac3bd59288e31fade"
+
+[[pkg]]
+name       = "postgres"
+version    = "0.1.0"
+constraint = "*"
+source     = "local:../taupostgres"
+checksum   = "sha256:9b0b4b8e81df31500ff97d166ee71b6b98a4d97ef64d76a6b9af6f1b0be433f9"
+

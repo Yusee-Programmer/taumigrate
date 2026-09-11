@@ -1,0 +1,155 @@
+# taumigrate.diff — structural comparison of tauorm's MetaData (the
+# schema as CODE says it should be) against a Vec[IntrospectedTable] (the
+# schema a LIVE database actually has), producing a flat list of
+# `SchemaOp`s. Purely structural: no SQL text here at all (see autogen.tr
+# for turning a Vec[SchemaOp] into dialect-correct up/down SQL) -- keeping
+# the two separate is what lets `diff_schema` alone answer "is there
+# anything pending?" (a dry-run / `status` report) without generating or
+# running anything.
+#
+# Column type comparison uses `ColumnType.ddl(dialect)` (the RENDERED DDL
+# text) against `IntrospectedColumn.raw_type`, not a semantic-kind
+# comparison -- see introspect.tr's header comment for why: SQLite's type
+# affinity collapses several distinct kinds onto the same declared text,
+# so a semantic-kind comparison would produce false-positive "changed"
+# diffs for e.g. a `Boolean()` column that round-trips as plain "INTEGER".
+# Comparison is case-insensitive and ignores a `(...)` length suffix
+# (`VARCHAR(50)` vs `VARCHAR(100)` reads as unchanged) -- Postgres's own
+# `information_schema` reports its OWN canonical, lowercase type names
+# (`"integer"`, `"character varying"`, ...), which don't literally match
+# this project's own uppercase, abbreviated DDL vocabulary even for an
+# untouched column; a short synonym table normalizes the common cases.
+# This is honest best-effort, not exact -- and, like every Postgres path
+# in this project, `--check`-clean but unverified against a live server
+# (see introspect.tr's header comment); SQLite comparison is exact and
+# verified (SQLite echoes back the CREATE TABLE's DDL text verbatim).
+
+from metadata import MetaData
+from table import Table
+from column import Column
+from introspect import IntrospectedTable, IntrospectedColumn
+from std.core.vec import Vec
+
+pub enum SchemaOp:
+    CreateTable(table: Table)
+    DropTable(table: IntrospectedTable)
+    AddColumn(table_name: str, column: Column)
+    DropColumn(table_name: str, column: IntrospectedColumn)
+    AlterColumn(table_name: str, old: IntrospectedColumn, new: Column)
+
+def _find_introspected(tables: Vec[IntrospectedTable], name: str) -> IntrospectedTable:
+    mut i = 0
+    while i < tables.len:
+        mut t = tables.get(i)
+        if t.name == name: return t
+        i = i + 1
+    return IntrospectedTable()   # sentinel: `.name` reads as "" (zero-init class field); callers check has_introspected() first
+
+def _has_introspected(tables: Vec[IntrospectedTable], name: str) -> bool:
+    mut i = 0
+    while i < tables.len:
+        if tables.get(i).name == name: return true
+        i = i + 1
+    return false
+
+def _has_table(tables: Vec[Table], name: str) -> bool:
+    mut i = 0
+    while i < tables.len:
+        if tables.get(i).name == name: return true
+        i = i + 1
+    return false
+
+def _has_column(cols: Vec[Column], name: str) -> bool:
+    mut i = 0
+    while i < cols.len:
+        if cols.get(i).name == name: return true
+        i = i + 1
+    return false
+
+def _find_introspected_column(it: IntrospectedTable, name: str) -> IntrospectedColumn:
+    mut i = 0
+    while i < it.columns.len:
+        mut c = it.columns.get(i)
+        if c.name == name: return c
+        i = i + 1
+    return it.columns.get(0)   # unreachable when called after has_col() guards
+
+# Strip a `(...)` length/precision suffix and lowercase -- see header
+# comment. `"VARCHAR(100)"` -> `"varchar"`, `"INTEGER"` -> `"integer"`.
+# `pub`: reused by autogen.tr's Postgres ALTER COLUMN emission, which
+# needs the identical "did the type actually change" check this file's
+# own diff already made once, rather than duplicating it.
+pub def base_type(raw: str) -> str:
+    mut s = raw.trim().to_lower()
+    mut paren = s.index_of("(")
+    if paren >= 0: s = s.slice(0, paren).trim()
+    return s
+
+# A handful of Postgres `information_schema.columns.data_type` canonical
+# names that don't literally match this project's own generated
+# vocabulary for an otherwise-unchanged column -- see header comment.
+def _normalize_postgres_synonym(t: str) -> str:
+    if t == "character varying": return "varchar"
+    if t == "character": return "varchar"
+    if t == "double precision": return "float"
+    if t == "real": return "float"
+    if t == "boolean": return "boolean"
+    if t == "timestamp without time zone": return "datetime"
+    if t == "timestamp with time zone": return "datetime"
+    if t == "bigint": return "bigint"
+    if t == "int8": return "bigint"
+    if t == "integer": return "integer"
+    if t == "int4": return "integer"
+    if t == "int": return "integer"
+    if t == "text": return "text"
+    return t
+
+pub def types_match(dialect: str, target_ddl: str, introspected_raw: str) -> bool:
+    mut a = base_type(target_ddl)
+    mut b = base_type(introspected_raw)
+    if dialect == "postgres":
+        a = _normalize_postgres_synonym(a)
+        b = _normalize_postgres_synonym(b)
+    return a == b
+
+pub def diff_schema(md: MetaData, introspected: Vec[IntrospectedTable], dialect: str) -> Vec[SchemaOp]:
+    mut ops: Vec[SchemaOp] = Vec[SchemaOp].init(8)
+
+    mut ti = 0
+    while ti < md.tables.len:
+        mut t = md.tables.get(ti)
+        if not _has_introspected(introspected, t.name):
+            ops.push(SchemaOp.CreateTable(t))
+        else:
+            mut it = _find_introspected(introspected, t.name)
+
+            mut ci = 0
+            while ci < t.columns.len:
+                mut c = t.columns.get(ci)
+                if not it.has_col(c.name):
+                    ops.push(SchemaOp.AddColumn(t.name, c))
+                else:
+                    mut ic = _find_introspected_column(it, c.name)
+                    mut changed = c.primary_key != ic.primary_key
+                    if not changed: changed = c.nullable != ic.nullable
+                    if not changed: changed = not types_match(dialect, c.col_type.ddl(dialect), ic.raw_type)
+                    if changed:
+                        ops.push(SchemaOp.AlterColumn(t.name, ic, c))
+                ci = ci + 1
+
+            mut ici = 0
+            while ici < it.columns.len:
+                mut ic2 = it.columns.get(ici)
+                if not _has_column(t.columns, ic2.name):
+                    ops.push(SchemaOp.DropColumn(t.name, ic2))
+                ici = ici + 1
+        ti = ti + 1
+
+    mut ii = 0
+    while ii < introspected.len:
+        mut it2 = introspected.get(ii)
+        if not _has_table(md.tables, it2.name):
+            ops.push(SchemaOp.DropTable(it2))
+        ii = ii + 1
+
+    return ops

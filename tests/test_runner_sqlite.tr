@@ -1,0 +1,153 @@
+# tests.test_runner_sqlite — real, in-memory proof of runner.tr's version
+# tracking + upgrade/downgrade against real SQLite, using hand-written
+# migrations (no autogenerate involved -- that's test_autogen_sqlite.tr).
+# A 3-migration chain: create users -> add users.age -> create posts.
+
+from migration import Migration
+from runner import ensure_version_table, current_revision, pending_migrations, upgrade_to_head, upgrade_one, downgrade_one, downgrade_to
+from sqlite_dialect import SqliteConnection, SqliteResultSet
+from engine import Engine
+from db_error import DbError
+from std.core.vec import Vec
+from std.test import TestRunner
+
+def up1(dialect: str) -> Vec[str]:
+    mut s: Vec[str] = Vec[str].init(1)
+    s.push("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+    return s
+
+def down1(dialect: str) -> Vec[str]:
+    mut s: Vec[str] = Vec[str].init(1)
+    s.push("DROP TABLE users")
+    return s
+
+def up2(dialect: str) -> Vec[str]:
+    mut s: Vec[str] = Vec[str].init(1)
+    s.push("ALTER TABLE users ADD COLUMN age INTEGER")
+    return s
+
+def down2(dialect: str) -> Vec[str]:
+    mut s: Vec[str] = Vec[str].init(1)
+    s.push("ALTER TABLE users DROP COLUMN age")
+    return s
+
+def up3(dialect: str) -> Vec[str]:
+    mut s: Vec[str] = Vec[str].init(1)
+    s.push("CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, title TEXT)")
+    return s
+
+def down3(dialect: str) -> Vec[str]:
+    mut s: Vec[str] = Vec[str].init(1)
+    s.push("DROP TABLE posts")
+    return s
+
+def table_exists(engine: Engine[SqliteConnection, SqliteResultSet], name: str) -> bool:
+    mut no_params: Vec[str] = Vec[str].init(0)
+    mut r: Result[SqliteResultSet, DbError] = engine.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='" + name + "'", no_params)
+    if r.is_err: return false
+    mut rs = r.ok
+    mut step: Result[bool, DbError] = rs.next()
+    mut found = false
+    if not step.is_err: found = step.ok
+    rs.release()
+    return found
+
+def main():
+    mut t = TestRunner.init("runner (sqlite)")
+
+    mut open_r: Result[SqliteConnection, DbError] = SqliteConnection.open(":memory:")
+    if open_r.is_err:
+        t.fail("could not open SQLite connection: " + open_r.err.message)
+        t.summary()
+        return
+    mut engine: Engine[SqliteConnection, SqliteResultSet] = Engine[SqliteConnection, SqliteResultSet].wrap(open_r.ok)
+
+    mut migrations: Vec[Migration] = Vec[Migration].init(3)
+    migrations.push(Migration.init("1", "", "create users", up1, down1))
+    migrations.push(Migration.init("2", "1", "add users.age", up2, down2))
+    migrations.push(Migration.init("3", "2", "create posts", up3, down3))
+
+    t.section("initial state")
+    mut cur0: Result[str, DbError] = current_revision[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if cur0.is_err:
+        t.fail("current_revision failed: " + cur0.err.message)
+        t.summary()
+        return
+    t.assert_eq_str(cur0.ok, "", "starts at base (no revision applied)")
+
+    mut pend0: Result[Vec[Migration], DbError] = pending_migrations[SqliteConnection, SqliteResultSet](engine, "sqlite", migrations)
+    if not pend0.is_err:
+        t.assert_eq_int(pend0.ok.len, 3, "all 3 migrations pending at base")
+
+    t.section("upgrade_one")
+    mut u1: Result[bool, DbError] = upgrade_one[SqliteConnection, SqliteResultSet](engine, "sqlite", migrations)
+    if u1.is_err:
+        t.fail("upgrade_one failed: " + u1.err.message)
+        t.summary()
+        return
+    t.assert_true(u1.ok, "upgrade_one applied a migration")
+    t.assert_true(table_exists(engine, "users"), "users table exists after migration 1")
+    mut cur1: Result[str, DbError] = current_revision[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not cur1.is_err:
+        t.assert_eq_str(cur1.ok, "1", "current revision is 1")
+
+    t.section("upgrade_to_head")
+    mut u2: Result[int, DbError] = upgrade_to_head[SqliteConnection, SqliteResultSet](engine, "sqlite", migrations)
+    if u2.is_err:
+        t.fail("upgrade_to_head failed: " + u2.err.message)
+        t.summary()
+        return
+    t.assert_eq_int(u2.ok, 2, "upgrade_to_head applied the remaining 2 migrations")
+    t.assert_true(table_exists(engine, "posts"), "posts table exists after upgrading to head")
+    mut cur2: Result[str, DbError] = current_revision[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not cur2.is_err:
+        t.assert_eq_str(cur2.ok, "3", "current revision is head (3)")
+
+    mut pend1: Result[Vec[Migration], DbError] = pending_migrations[SqliteConnection, SqliteResultSet](engine, "sqlite", migrations)
+    if not pend1.is_err:
+        t.assert_eq_int(pend1.ok.len, 0, "nothing pending at head")
+
+    t.section("data survives an ADD COLUMN migration")
+    mut no_params: Vec[str] = Vec[str].init(0)
+    mut ins: Result[SqliteResultSet, DbError] = engine.execute("INSERT INTO users (id, name, age) VALUES (1, 'Ada', 36)", no_params)
+    if not ins.is_err:
+        mut irs = ins.ok
+        irs.next()
+        irs.release()
+    mut sel: Result[SqliteResultSet, DbError] = engine.execute("SELECT age FROM users WHERE id = 1", no_params)
+    if not sel.is_err:
+        mut srs = sel.ok
+        mut sstep: Result[bool, DbError] = srs.next()
+        if not sstep.is_err and sstep.ok:
+            t.assert_eq_int(srs.get_int(0), 36, "age column holds the inserted value")
+        srs.release()
+
+    t.section("downgrade_one")
+    mut d1: Result[bool, DbError] = downgrade_one[SqliteConnection, SqliteResultSet](engine, "sqlite", migrations)
+    if d1.is_err:
+        t.fail("downgrade_one failed: " + d1.err.message)
+        t.summary()
+        return
+    t.assert_true(d1.ok, "downgrade_one reverted a migration")
+    t.assert_false(table_exists(engine, "posts"), "posts table gone after downgrade")
+    mut cur3: Result[str, DbError] = current_revision[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not cur3.is_err:
+        t.assert_eq_str(cur3.ok, "2", "current revision back to 2")
+
+    t.section("downgrade_to base")
+    mut d2: Result[int, DbError] = downgrade_to[SqliteConnection, SqliteResultSet](engine, "sqlite", migrations, "")
+    if d2.is_err:
+        t.fail("downgrade_to failed: " + d2.err.message)
+        t.summary()
+        return
+    t.assert_eq_int(d2.ok, 2, "downgrade_to base reverted the remaining 2 migrations")
+    t.assert_false(table_exists(engine, "users"), "users table gone after downgrade to base")
+    mut cur4: Result[str, DbError] = current_revision[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not cur4.is_err:
+        t.assert_eq_str(cur4.ok, "", "back at base")
+
+    mut d3: Result[bool, DbError] = downgrade_one[SqliteConnection, SqliteResultSet](engine, "sqlite", migrations)
+    if not d3.is_err:
+        t.assert_false(d3.ok, "downgrade_one at base is a no-op, not an error")
+
+    t.summary()

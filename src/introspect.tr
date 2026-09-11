@@ -1,0 +1,260 @@
+# taumigrate.introspect — reflects a LIVE database's actual schema back
+# into IntrospectedTable/IntrospectedColumn, the other half of what
+# autogenerate diffs against (the other half being tauorm's own
+# MetaData/Table/Column -- the schema as CODE says it should be).
+#
+# Each column's type is kept as the exact DDL text the database reports
+# (`raw_type`), not reverse-mapped into a semantic `ColumnType.kind`. This
+# is a deliberate, honest choice, not a shortcut: SQLite's type-affinity
+# system collapses several distinct Tauraro-level kinds onto the SAME
+# declared text (integer/bigint/boolean all declare "INTEGER";
+# text/varchar/datetime all declare "TEXT" -- see col_types.tr), so there
+# is no way to reverse a bare "INTEGER" back to one specific kind without
+# guessing. diff.tr compares by RENDERED DDL text (`target.col_type.ddl
+# (dialect)` vs. `introspected.raw_type`) for exactly this reason -- it
+# sidesteps the ambiguity entirely rather than producing false-positive
+# "type changed" diffs for e.g. a `Boolean()` column that round-trips as
+# plain "INTEGER" on SQLite.
+#
+# Postgres introspection (`introspect_postgres`) is written and
+# `--check`-clean but UNTRIED against a live server -- no Postgres server
+# is available in this environment, matching every other Postgres code
+# path in tauorm itself (see its PROPOSAL.md's Status section). SQLite
+# introspection is real, run, and verified end-to-end (tests/).
+
+from dbapi import DbConnection, DbResultSet
+from db_error import DbError
+from engine import Engine
+from table import Table
+from column import Column
+from col_types import Raw
+from std.core.vec import Vec
+
+pub class IntrospectedColumn:
+    pub name:        str
+    pub raw_type:     str    # exact dialect DDL type text, as the DB reports it
+    pub nullable:       bool
+    pub primary_key:     bool
+
+extend IntrospectedColumn:
+    pub def init(name: str, raw_type: str, nullable: bool, primary_key: bool) -> IntrospectedColumn:
+        mut c = IntrospectedColumn()
+        c.name = name
+        c.raw_type = raw_type
+        # A primary-key column is normalized to non-nullable regardless of
+        # what the driver itself reports for its NOT NULL flag -- needed
+        # because SQLite has a real, well-known quirk here: a bare
+        # `INTEGER PRIMARY KEY` column (no explicit `NOT NULL` written)
+        # reports `notnull=0` in `PRAGMA table_info`, even though it's the
+        # table's primary key (SQLite's rowid-alias PK columns are
+        # nullable at the storage layer unless NOT NULL is added
+        # explicitly -- unlike standard SQL). Without this normalization,
+        # every table tauorm itself creates (`Column.pk()` always forces
+        # `nullable = false`, in column.tr) would show a spurious
+        # "column changed" diff purely from this asymmetry, on every
+        # single autogenerate run, forever.
+        c.nullable = nullable and not primary_key
+        c.primary_key = primary_key
+        return c
+
+pub class IntrospectedTable:
+    pub name:    str
+    pub columns: Vec[IntrospectedColumn]
+
+extend IntrospectedTable:
+    pub def init(name: str) -> IntrospectedTable:
+        mut t = IntrospectedTable()
+        t.name = name
+        t.columns = Vec[IntrospectedColumn].init(4)
+        return t
+
+    pub def col(self, name: str) throws str -> IntrospectedColumn:
+        mut i = 0
+        while i < self.columns.len:
+            mut c = self.columns.get(i)
+            if c.name == name: return c
+            i = i + 1
+        raise("introspected table '" + self.name + "' has no column '" + name + "'")
+
+    pub def has_col(self, name: str) -> bool:
+        mut i = 0
+        while i < self.columns.len:
+            if self.columns.get(i).name == name: return true
+            i = i + 1
+        return false
+
+# Reconstruct a Table (usable with .create_sql(dialect)/.drop_sql()) from
+# an introspected one -- used for a DropTable migration's `down` step and
+# for SQLite's copy-table-rebuild dance (see autogen.tr), both of which
+# need to re-render DDL for a table this tool only ever SAW, never
+# defined. Each column's type is carried through via ColumnType.Raw(...)
+# rather than guessed at.
+pub def introspected_column_to_column(ic: IntrospectedColumn) -> Column:
+    mut c = Column.init(ic.name, Raw(ic.raw_type))
+    if ic.primary_key:
+        c = c.pk()
+    elif not ic.nullable:
+        c = c.not_null()
+    return c
+
+pub def introspected_to_table(it: IntrospectedTable) -> Table:
+    mut cols: Vec[Column] = Vec[Column].init(it.columns.len)
+    mut i = 0
+    while i < it.columns.len:
+        cols.push(introspected_column_to_column(it.columns.get(i)))
+        i = i + 1
+    return Table.init(it.name, cols)
+
+# Introspection SQL interpolates a table name directly into the query
+# text (SQLite's `PRAGMA table_info(...)` doesn't accept a bound
+# parameter for an object name the way a value placeholder does) -- this
+# guards against a table name containing anything but a plain identifier
+# character before it ever reaches a SQL string.
+pub def _is_safe_ident(name: str) -> bool:
+    if name.len() == 0: return false
+    mut i = 0
+    while i < name.len():
+        mut b = name[i] as int
+        mut ok = (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95
+        if not ok: return false
+        i = i + 1
+    return true
+
+pub def introspect_schema[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS], dialect: str) throws DbError -> Vec[IntrospectedTable]:
+    if dialect == "postgres":
+        return introspect_postgres[C, RS](engine)
+    return introspect_sqlite[C, RS](engine)
+
+pub def introspect_sqlite[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS]) throws DbError -> Vec[IntrospectedTable]:
+    mut out: Vec[IntrospectedTable] = Vec[IntrospectedTable].init(8)
+    mut no_params: Vec[str] = Vec[str].init(0)
+
+    mut names: Vec[str] = Vec[str].init(8)
+    mut tr: Result[RS, DbError] = engine.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", no_params)
+    if tr.is_err:
+        raise(DbError.init(tr.err.code, tr.err.message))
+    mut trs = tr.ok
+    mut going = true
+    while going:
+        mut step: Result[bool, DbError] = trs.next()
+        if step.is_err:
+            raise(DbError.init(step.err.code, step.err.message))
+        if not step.ok:
+            going = false
+        else:
+            names.push(trs.get_str(0))
+    trs.release()
+
+    mut ti = 0
+    while ti < names.len:
+        mut tname = names.get(ti)
+        if not _is_safe_ident(tname):
+            raise(DbError.init("MIGRATION_UNSAFE_IDENT", "refusing to introspect table with a non-identifier name: '" + tname + "'"))
+        mut it = IntrospectedTable.init(tname)
+
+        mut cr: Result[RS, DbError] = engine.execute("PRAGMA table_info(" + tname + ")", no_params)
+        if cr.is_err:
+            raise(DbError.init(cr.err.code, cr.err.message))
+        mut crs = cr.ok
+        mut cgoing = true
+        while cgoing:
+            mut cstep: Result[bool, DbError] = crs.next()
+            if cstep.is_err:
+                raise(DbError.init(cstep.err.code, cstep.err.message))
+            if not cstep.ok:
+                cgoing = false
+            else:
+                # PRAGMA table_info(t) columns: cid, name, type, notnull, dflt_value, pk
+                mut cname = crs.get_str(1)
+                mut ctype = crs.get_str(2)
+                mut cnotnull = crs.get_int(3)
+                mut cpk = crs.get_int(5)
+                it.columns.push(IntrospectedColumn.init(cname, ctype, cnotnull == 0, cpk > 0))
+        crs.release()
+
+        out.push(it)
+        ti = ti + 1
+    return out
+
+pub def introspect_postgres[C: DbConnection[RS], RS: DbResultSet](engine: Engine[C, RS]) throws DbError -> Vec[IntrospectedTable]:
+    mut out: Vec[IntrospectedTable] = Vec[IntrospectedTable].init(8)
+    mut no_params: Vec[str] = Vec[str].init(0)
+
+    mut names: Vec[str] = Vec[str].init(8)
+    mut tr: Result[RS, DbError] = engine.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'", no_params)
+    if tr.is_err:
+        raise(DbError.init(tr.err.code, tr.err.message))
+    mut trs = tr.ok
+    mut going = true
+    while going:
+        mut step: Result[bool, DbError] = trs.next()
+        if step.is_err:
+            raise(DbError.init(step.err.code, step.err.message))
+        if not step.ok:
+            going = false
+        else:
+            names.push(trs.get_str(0))
+    trs.release()
+
+    mut ti = 0
+    while ti < names.len:
+        mut tname = names.get(ti)
+        mut it = IntrospectedTable.init(tname)
+
+        mut pk_cols: Vec[str] = Vec[str].init(2)
+        mut pkr: Result[RS, DbError] = engine.execute(
+            "SELECT kcu.column_name FROM information_schema.table_constraints tc " +
+            "JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema " +
+            "WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public' AND tc.table_name = $1",
+            _one_param(tname))
+        if pkr.is_err:
+            raise(DbError.init(pkr.err.code, pkr.err.message))
+        mut pkrs = pkr.ok
+        mut pkgoing = true
+        while pkgoing:
+            mut pkstep: Result[bool, DbError] = pkrs.next()
+            if pkstep.is_err:
+                raise(DbError.init(pkstep.err.code, pkstep.err.message))
+            if not pkstep.ok:
+                pkgoing = false
+            else:
+                pk_cols.push(pkrs.get_str(0))
+        pkrs.release()
+
+        mut cr: Result[RS, DbError] = engine.execute(
+            "SELECT column_name, data_type, is_nullable FROM information_schema.columns " +
+            "WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position",
+            _one_param(tname))
+        if cr.is_err:
+            raise(DbError.init(cr.err.code, cr.err.message))
+        mut crs = cr.ok
+        mut cgoing = true
+        while cgoing:
+            mut cstep: Result[bool, DbError] = crs.next()
+            if cstep.is_err:
+                raise(DbError.init(cstep.err.code, cstep.err.message))
+            if not cstep.ok:
+                cgoing = false
+            else:
+                mut cname = crs.get_str(0)
+                mut ctype = crs.get_str(1)
+                mut cnullable = crs.get_str(2) == "YES"
+                mut cpk = _vec_contains(pk_cols, cname)
+                it.columns.push(IntrospectedColumn.init(cname, ctype, cnullable, cpk))
+        crs.release()
+
+        out.push(it)
+        ti = ti + 1
+    return out
+
+def _one_param(v: str) -> Vec[str]:
+    mut p: Vec[str] = Vec[str].init(1)
+    p.push(v)
+    return p
+
+def _vec_contains(v: Vec[str], s: str) -> bool:
+    mut i = 0
+    while i < v.len:
+        if v.get(i) == s: return true
+        i = i + 1
+    return false

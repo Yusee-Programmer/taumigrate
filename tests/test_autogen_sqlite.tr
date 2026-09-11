@@ -1,0 +1,194 @@
+# tests.test_autogen_sqlite — real, in-memory proof of the full
+# autogenerate cycle against SQLite: introspect a live (empty, then
+# evolving) DB, diff it against a target MetaData, generate SQL, run it,
+# re-introspect, and confirm the diff is now empty. Exercises every
+# SchemaOp kind: CreateTable, AddColumn, AlterColumn (SQLite's
+# copy-table-rebuild dance -- the one case with no direct ALTER), and
+# DropColumn/DropTable, checking real row data survives each step.
+
+from metadata import MetaData
+from table import Table
+from column import Column
+from col_types import Integer, Text, Float
+from introspect import IntrospectedTable, introspect_schema
+from diff import diff_schema
+from autogen import generate_migration_sql
+from sqlite_dialect import SqliteConnection, SqliteResultSet
+from engine import Engine
+from db_error import DbError
+from std.core.vec import Vec
+from std.test import TestRunner
+
+def run_sql(engine: Engine[SqliteConnection, SqliteResultSet], stmts: Vec[str]) -> bool:
+    mut no_params: Vec[str] = Vec[str].init(0)
+    mut i = 0
+    while i < stmts.len:
+        mut r: Result[SqliteResultSet, DbError] = engine.execute(stmts.get(i), no_params)
+        if r.is_err: return false
+        mut rs = r.ok
+        mut step: Result[bool, DbError] = rs.next()
+        rs.release()
+        if step.is_err: return false
+        i = i + 1
+    return true
+
+def get_int(engine: Engine[SqliteConnection, SqliteResultSet], sql: str) -> int:
+    mut no_params: Vec[str] = Vec[str].init(0)
+    mut r: Result[SqliteResultSet, DbError] = engine.execute(sql, no_params)
+    if r.is_err: return -1
+    mut rs = r.ok
+    mut step: Result[bool, DbError] = rs.next()
+    mut v = -1
+    if not step.is_err and step.ok: v = rs.get_int(0)
+    rs.release()
+    return v
+
+def get_str(engine: Engine[SqliteConnection, SqliteResultSet], sql: str) -> str:
+    mut no_params: Vec[str] = Vec[str].init(0)
+    mut r: Result[SqliteResultSet, DbError] = engine.execute(sql, no_params)
+    if r.is_err: return ""
+    mut rs = r.ok
+    mut step: Result[bool, DbError] = rs.next()
+    mut v = ""
+    if not step.is_err and step.ok: v = rs.get_str(0)
+    rs.release()
+    return v
+
+def main():
+    mut t = TestRunner.init("autogen (sqlite)")
+
+    mut open_r: Result[SqliteConnection, DbError] = SqliteConnection.open(":memory:")
+    if open_r.is_err:
+        t.fail("could not open SQLite connection: " + open_r.err.message)
+        t.summary()
+        return
+    mut engine: Engine[SqliteConnection, SqliteResultSet] = Engine[SqliteConnection, SqliteResultSet].wrap(open_r.ok)
+
+    # -- Step 1: CreateTable --------------------------------------------------
+    t.section("CreateTable")
+    mut cols1: Vec[Column] = Vec[Column].init(2)
+    cols1.push(Column.init("id", Integer()).pk())
+    cols1.push(Column.init("name", Text()).not_null())
+    mut md = MetaData.init()
+    md.add(Table.init("widgets", cols1))
+
+    mut intro1_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if intro1_r.is_err:
+        t.fail("introspect (empty db) failed: " + intro1_r.err.message)
+        t.summary()
+        return
+    mut ops1 = diff_schema(md, intro1_r.ok, "sqlite")
+    t.assert_eq_int(ops1.len, 1, "one op (CreateTable) against an empty DB")
+
+    mut gen1 = generate_migration_sql(md, intro1_r.ok, "sqlite")
+    t.assert_true(run_sql(engine, gen1.up), "applying the generated CreateTable succeeds")
+
+    mut intro1b_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not intro1b_r.is_err:
+        mut ops1b = diff_schema(md, intro1b_r.ok, "sqlite")
+        t.assert_eq_int(ops1b.len, 0, "diff is empty once the DB matches the target")
+
+    mut no_params: Vec[str] = Vec[str].init(0)
+    mut ins1: Vec[str] = Vec[str].init(1)
+    ins1.push("INSERT INTO widgets (id, name) VALUES (1, 'Ada')")
+    t.assert_true(run_sql(engine, ins1), "seed row inserted")
+
+    # -- Step 2: AddColumn ------------------------------------------------------
+    t.section("AddColumn")
+    md.tables.get(0).columns.push(Column.init("price", Float()))
+    mut intro2_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if intro2_r.is_err:
+        t.fail("introspect (before add column) failed: " + intro2_r.err.message)
+        t.summary()
+        return
+    mut ops2 = diff_schema(md, intro2_r.ok, "sqlite")
+    t.assert_eq_int(ops2.len, 1, "one op (AddColumn) after adding price to the target")
+
+    mut gen2 = generate_migration_sql(md, intro2_r.ok, "sqlite")
+    t.assert_true(run_sql(engine, gen2.up), "applying the generated AddColumn succeeds")
+    t.assert_eq_str(get_str(engine, "SELECT name FROM widgets WHERE id = 1"), "Ada", "existing row survives an ADD COLUMN")
+
+    mut intro2b_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not intro2b_r.is_err:
+        mut ops2b = diff_schema(md, intro2b_r.ok, "sqlite")
+        t.assert_eq_int(ops2b.len, 0, "diff is empty again after applying AddColumn")
+
+    mut upd2: Vec[str] = Vec[str].init(1)
+    upd2.push("UPDATE widgets SET price = 9.5 WHERE id = 1")
+    run_sql(engine, upd2)
+
+    # -- Step 3: AlterColumn (SQLite rebuild dance) ------------------------------
+    t.section("AlterColumn (type change -> SQLite rebuild)")
+    # Replace "name" with a version that's nullable (was NOT NULL) -- a real,
+    # detectable column-level change with no direct SQLite ALTER equivalent.
+    md.tables.get(0).columns.get(1).nullable = true
+    mut intro3_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if intro3_r.is_err:
+        t.fail("introspect (before alter column) failed: " + intro3_r.err.message)
+        t.summary()
+        return
+    mut ops3 = diff_schema(md, intro3_r.ok, "sqlite")
+    t.assert_eq_int(ops3.len, 1, "one op (AlterColumn) after relaxing name's NOT NULL")
+
+    mut gen3 = generate_migration_sql(md, intro3_r.ok, "sqlite")
+    t.assert_true(gen3.up.len > 1, "SQLite AlterColumn generates a multi-statement rebuild, not a single ALTER")
+    t.assert_true(run_sql(engine, gen3.up), "applying the generated rebuild succeeds")
+    t.assert_eq_str(get_str(engine, "SELECT name FROM widgets WHERE id = 1"), "Ada", "name column survives the rebuild")
+    mut price_after_rebuild = get_str(engine, "SELECT price FROM widgets WHERE id = 1")
+    t.assert_true(price_after_rebuild == "9.5", "price column also survives the rebuild")
+
+    mut intro3b_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not intro3b_r.is_err:
+        mut ops3b = diff_schema(md, intro3b_r.ok, "sqlite")
+        t.assert_eq_int(ops3b.len, 0, "diff is empty again after the rebuild")
+
+    # Undo() should restore the original NOT NULL shape.
+    t.section("AlterColumn down (undo the rebuild)")
+    t.assert_true(run_sql(engine, gen3.down), "reverting the rebuild succeeds")
+    t.assert_eq_str(get_str(engine, "SELECT name FROM widgets WHERE id = 1"), "Ada", "name column survives the REVERSED rebuild too")
+
+    # Re-apply up so the rest of the test continues from the target shape.
+    run_sql(engine, gen3.up)
+
+    # -- Step 4: DropColumn -------------------------------------------------------
+    t.section("DropColumn")
+    mut new_cols: Vec[Column] = Vec[Column].init(2)
+    new_cols.push(Column.init("id", Integer()).pk())
+    new_cols.push(Column.init("name", Text()))
+    md.tables.get(0).columns = new_cols   # drop "price" from the target
+    mut intro4_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if intro4_r.is_err:
+        t.fail("introspect (before drop column) failed: " + intro4_r.err.message)
+        t.summary()
+        return
+    mut ops4 = diff_schema(md, intro4_r.ok, "sqlite")
+    t.assert_eq_int(ops4.len, 1, "one op (DropColumn) after removing price from the target")
+
+    mut gen4 = generate_migration_sql(md, intro4_r.ok, "sqlite")
+    t.assert_true(run_sql(engine, gen4.up), "applying the generated DropColumn succeeds")
+    t.assert_eq_str(get_str(engine, "SELECT name FROM widgets WHERE id = 1"), "Ada", "name column survives DropColumn")
+
+    mut intro4b_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not intro4b_r.is_err:
+        mut ops4b = diff_schema(md, intro4b_r.ok, "sqlite")
+        t.assert_eq_int(ops4b.len, 0, "diff is empty again after DropColumn")
+
+    # -- Step 5: DropTable ----------------------------------------------------------
+    t.section("DropTable")
+    mut empty_md = MetaData.init()
+    mut intro5_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if intro5_r.is_err:
+        t.fail("introspect (before drop table) failed: " + intro5_r.err.message)
+        t.summary()
+        return
+    mut ops5 = diff_schema(empty_md, intro5_r.ok, "sqlite")
+    t.assert_eq_int(ops5.len, 1, "one op (DropTable) against an empty target")
+
+    mut gen5 = generate_migration_sql(empty_md, intro5_r.ok, "sqlite")
+    t.assert_true(run_sql(engine, gen5.up), "applying the generated DropTable succeeds")
+
+    mut intro5b_r: Result[Vec[IntrospectedTable], DbError] = introspect_schema[SqliteConnection, SqliteResultSet](engine, "sqlite")
+    if not intro5b_r.is_err:
+        t.assert_eq_int(intro5b_r.ok.len, 0, "no tables remain")
+
+    t.summary()

@@ -1,0 +1,35 @@
+[package]
+name    = "taumigrate"
+version = "0.1.0"
+desc    = "An Alembic-equivalent migrations toolkit for tauorm -- versioned revision chains, a DB-side version-tracking table, upgrade/downgrade, and autogenerate (schema introspection + diff against tauorm's MetaData)."
+license = "Apache-2.0"
+# A pure library's entry point IS its library module (taumigrate.tr), not
+# a main.tr -- consumers do `from taumigrate import Migration, ...`, and
+# `taupkg build` compile-checks the module (tauraroc synthesizes the entry).
+bin     = "src/taumigrate.tr"
+
+[deps]
+# tauorm supplies the schema representation (Table/Column/MetaData/
+# col_types) this package diffs against, plus the dialect-agnostic
+# DbConnection/DbResultSet/Engine boundary every runner/introspection
+# function is generic over. taumigrate never imports a concrete driver
+# (postgres_dialect.tr/sqlite_dialect.tr) directly in its own SOURCE --
+# same reasoning as tauorm's own hub: a consumer brings whichever
+# dialect(s) they built tauorm with. The two backends are declared again
+# here, OPTIONAL, purely so this package's own tests (which DO need a
+# real driver to run against) can pull one in -- taupkg's [features]
+# has no dependency-feature-passthrough syntax (checked
+# taupkg/src/features.tr: a feature only maps to other feature names or
+# optional-dep names within the SAME manifest), so mirroring tauorm's own
+# declaration here (rather than trying to forward into it) is the
+# supported way to get tausqlite3 on the path for `taupkg test --features
+# sqlite` in THIS package.
+tauorm   = { path = "../tauorm" }
+postgres = { path = "../taupostgres", optional = true }
+sqlite3  = { path = "../tausqlite3",  optional = true }
+
+[features]
+default  = ""
+postgres = "postgres"
+sqlite   = "sqlite3"
+all      = "postgres, sqlite3"

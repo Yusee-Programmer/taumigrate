@@ -1,0 +1,89 @@
+# tests.test_migration_chain — pure-logic proof of migration.tr's
+# build_chain(): normal linear ordering, plus every documented error case
+# (multi-root, multi-head, orphan, cycle). No DB involved.
+
+from migration import Migration, build_chain
+from db_error import DbError
+from std.core.vec import Vec
+from std.test import TestRunner
+
+def noop_up(dialect: str) -> Vec[str]:
+    return Vec[str].init(0)
+
+def noop_down(dialect: str) -> Vec[str]:
+    return Vec[str].init(0)
+
+def mk(rev: str, down: str) -> Migration:
+    return Migration.init(rev, down, "m" + rev, noop_up, noop_down)
+
+def main():
+    mut t = TestRunner.init("migration chain builder")
+
+    t.section("normal linear chain")
+    mut ms: Vec[Migration] = Vec[Migration].init(3)
+    ms.push(mk("2", "1"))
+    ms.push(mk("1", ""))
+    ms.push(mk("3", "2"))
+    mut r: Result[Vec[Migration], DbError] = build_chain(ms)
+    if r.is_err:
+        t.fail("build_chain failed: " + r.err.message)
+    else:
+        mut chain = r.ok
+        t.assert_eq_int(chain.len, 3, "chain has all 3 migrations")
+        t.assert_eq_str(chain.get(0).revision, "1", "root is first")
+        t.assert_eq_str(chain.get(1).revision, "2", "middle is second")
+        t.assert_eq_str(chain.get(2).revision, "3", "head is last")
+
+    t.section("empty input")
+    mut empty: Vec[Migration] = Vec[Migration].init(0)
+    mut r2: Result[Vec[Migration], DbError] = build_chain(empty)
+    t.assert_true(not r2.is_err, "empty input is not an error")
+    if not r2.is_err:
+        t.assert_eq_int(r2.ok.len, 0, "empty input yields an empty chain")
+
+    t.section("multi-root")
+    mut mr: Vec[Migration] = Vec[Migration].init(2)
+    mr.push(mk("a", ""))
+    mr.push(mk("b", ""))
+    mut r3: Result[Vec[Migration], DbError] = build_chain(mr)
+    t.assert_true(r3.is_err, "two roots is rejected")
+    if r3.is_err:
+        t.assert_eq_str(r3.err.code, "MIGRATION_MULTI_ROOT", "multi-root error code")
+
+    t.section("no root")
+    mut nr: Vec[Migration] = Vec[Migration].init(1)
+    nr.push(mk("x", "y"))
+    mut r4: Result[Vec[Migration], DbError] = build_chain(nr)
+    t.assert_true(r4.is_err, "no root is rejected")
+    if r4.is_err:
+        t.assert_eq_str(r4.err.code, "MIGRATION_NO_ROOT", "no migration has down_revision==\"\" so the root check fires before an orphan walk ever starts")
+
+    t.section("multi-head (branch)")
+    mut mh: Vec[Migration] = Vec[Migration].init(3)
+    mh.push(mk("1", ""))
+    mh.push(mk("2a", "1"))
+    mh.push(mk("2b", "1"))
+    mut r5: Result[Vec[Migration], DbError] = build_chain(mh)
+    t.assert_true(r5.is_err, "two migrations built on the same parent is rejected")
+    if r5.is_err:
+        t.assert_eq_str(r5.err.code, "MIGRATION_MULTI_HEAD", "multi-head error code")
+
+    t.section("orphan down_revision")
+    mut orp: Vec[Migration] = Vec[Migration].init(2)
+    orp.push(mk("1", ""))
+    orp.push(mk("3", "2"))   # "2" doesn't exist
+    mut r6: Result[Vec[Migration], DbError] = build_chain(orp)
+    t.assert_true(r6.is_err, "a down_revision naming a missing migration is rejected")
+    if r6.is_err:
+        t.assert_eq_str(r6.err.code, "MIGRATION_ORPHAN", "orphan error code")
+
+    t.section("duplicate revision")
+    mut dup: Vec[Migration] = Vec[Migration].init(2)
+    dup.push(mk("1", ""))
+    dup.push(mk("1", ""))
+    mut r7: Result[Vec[Migration], DbError] = build_chain(dup)
+    t.assert_true(r7.is_err, "two migrations with the same revision id is rejected")
+    if r7.is_err:
+        t.assert_eq_str(r7.err.code, "MIGRATION_DUP_REVISION", "dup-revision error code")
+
+    t.summary()
